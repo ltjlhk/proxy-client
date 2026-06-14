@@ -192,7 +192,7 @@ class TrojanVpnService : VpnService() {
                     srcIP = dstIP, dstIP = srcIP,
                     srcPort = dstPort, dstPort = srcPort,
                     seq = mySeq, ack = seq + 1,
-                    syn = true, ack = true,
+                    syn = true, ackFlag = true,
                     window = 65535
                 )
                 vpnOut.write(synAckPacket)
@@ -541,11 +541,10 @@ class TrojanVpnService : VpnService() {
             out.write(password.toByteArray(Charsets.UTF_8))
             out.write("\r\n".toByteArray())
             // Target in SOCKS5-like format
-            out.write(0x03) // ATYPE_DOMAIN
-            out.write(targetHost.length)
+            out.write(byteArrayOf(0x03)) // ATYPE_DOMAIN
+            out.write(byteArrayOf(targetHost.length.toByte()))
             out.write(targetHost.toByteArray(Charsets.UTF_8))
-            out.write((targetPort shr 8).toByte())
-            out.write((targetPort and 0xFF).toByte())
+            out.write(byteArrayOf(((targetPort shr 8) and 0xFF).toByte(), (targetPort and 0xFF).toByte()))
             out.write("\r\n".toByteArray())
             out.flush()
 
