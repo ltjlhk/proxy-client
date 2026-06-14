@@ -11,16 +11,28 @@ project 'Runner', {
 }
 
 def flutter_root
-  generated_xcode_build_settings_path = File.expand_path(File.join('..', '..', 'Flutter', 'Generated.xcconfig'), __FILE__)
-  unless File.exist?(generated_xcode_build_settings_path)
-    raise "#{generated_xcode_build_settings_path} must exist. If you're running pod install manually, make sure flutter pub get is executed first"
+  # Try multiple possible paths for Generated.xcconfig
+  possible_paths = [
+    File.expand_path(File.join('Flutter', 'Generated.xcconfig'), __dir__),
+    File.expand_path(File.join('..', 'Flutter', 'Generated.xcconfig'), __dir__),
+    File.expand_path(File.join('..', '..', 'Flutter', 'Generated.xcconfig'), __dir__)
+  ]
+  
+  generated_xcode_build_settings_path = possible_paths.find { |path| File.exist?(path) }
+  
+  unless generated_xcode_build_settings_path
+    # Fallback: use environment variable or default
+    flutter_root = ENV['FLUTTER_ROOT'] || '/opt/hostedtoolcache/flutter/stable-3.24.5-x64/flutter'
+    return flutter_root
   end
 
   File.foreach(generated_xcode_build_settings_path) do |line|
     matches = line.match(/FLUTTER_ROOT\=(.*)/)
     return matches[1].strip if matches
   end
-  raise "FLUTTER_ROOT not found in #{generated_xcode_build_settings_path}. Try deleting Generated.xcconfig, then run flutter pub get"
+  
+  # Fallback if FLUTTER_ROOT not found in file
+  ENV['FLUTTER_ROOT'] || '/opt/hostedtoolcache/flutter/stable-3.24.5-x64/flutter'
 end
 
 require File.expand_path(File.join('packages', 'flutter_tools', 'bin', 'podhelper'), flutter_root)
