@@ -4,49 +4,32 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
-import android.content.Context
 import android.content.Intent
 import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
 import android.util.Log
 import androidx.core.app.NotificationCompat
-import java.io.InputStream
-import java.io.OutputStream
+import java.io.FileInputStream
+import java.io.FileOutputStream
+import java.net.InetAddress
 import java.net.InetSocketAddress
-import java.net.ServerSocket
 import java.net.Socket
-import java.security.SecureRandom
-import java.security.cert.X509Certificate
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import javax.net.ssl.SNIHostName
 import javax.net.ssl.SSLContext
 import javax.net.ssl.SSLSocket
+import javax.net.ssl.TrustManager
 import javax.net.ssl.X509TrustManager
 
-/**
- * TrojanVpnService - 本地 SOCKS5 代理服务器 + Trojan 协议转发。
- *
- * 架构：
- * 1. 在本地启动 SOCKS5 代理服务器（默认端口 7890）
- * 2. 接收客户端的 SOCKS5 连接请求
- * 3. 通过 Trojan 协议（TLS + 密码认证）将流量转发到远程服务器
- * 4. 使用 VpnService.protect() 保护 Trojan 连接，防止回环
- *
- * 优点：
- * - 不需要处理 IP 包和 TCP 状态机
- * - SOCKS5 协议简单可靠
- * - 不依赖外部二进制（sing-box）
- *
- * 使用方式：
- * 连接后需要在 WiFi 设置中配置 HTTP 代理: 127.0.0.1:7890
- */
 class TrojanVpnService : VpnService() {
 
     companion object {
-        const val TAG = "TrojanVpnService"
-        const val NOTIFICATION_CHANNEL_ID = "trojan_vpn_channel"
-        const val NOTIFICATION_ID = 1001
-
+        private const val TAG = "TrojanVpn"
+        private const val CHANNEL_ID = "trojan_vpn_channel"
+        private const val NOTIF_ID = 1001
         const val ACTION_CONNECT = "com.proxyclient.proxy_client.CONNECT"
         const val ACTION_DISCONNECT = "com.proxyclient.proxy_client.DISCONNECT"
 
@@ -55,16 +38,17 @@ class TrojanVpnService : VpnService() {
     }
 
     private var vpnInterface: ParcelFileDescriptor? = null
-    private var serverSocket: ServerSocket? = null
-    private var proxyThread: Thread? = null
-    private val isActive = java.util.concurrent.atomic.AtomicBoolean(false)
-
-    // Server configuration (defaults, overridden by intent extras)
+    private val running = AtomicBoolean(false)
     private var serverHost = "47.80.241.156"
     private var serverPort = 8443
-    private var trojanPassword = "proxy123456"
-    private var tlsSni = "proxy.local"
-    private var localSocksPort = 7890
+    private var password = "proxy123456"
+    private var sni = "proxy.local"
+
+    // TCP connection tracking: key = "srcIP:srcPort-dstIP:dstPort"
+    private val tcpConnections = ConcurrentHashMap<String, TcpTunnel>()
+
+    // Sequence counters for TCP
+    private val seqCounter = AtomicInteger(1000000)
 
     override fun onCreate() {
         super.onCreate()
@@ -76,32 +60,23 @@ class TrojanVpnService : VpnService() {
             ACTION_CONNECT -> {
                 serverHost = intent.getStringExtra("serverHost") ?: serverHost
                 serverPort = intent.getIntExtra("serverPort", serverPort)
-                trojanPassword = intent.getStringExtra("trojanPassword") ?: trojanPassword
-                tlsSni = intent.getStringExtra("tlsSni") ?: tlsSni
-                startProxy()
+                password = intent.getStringExtra("trojanPassword") ?: password
+                sni = intent.getStringExtra("tlsSni") ?: sni
+                startVpn()
             }
-            ACTION_DISCONNECT -> stopProxy()
+            ACTION_DISCONNECT -> stopVpn()
         }
         return START_STICKY
     }
 
-    /**
-     * Start the SOCKS5 proxy server.
-     *
-     * We still create a minimal VpnService TUN interface so that:
-     * 1. The service can run as a foreground service (required on Android 8+)
-     * 2. We can use protect() to prevent routing loops on Trojan connections
-     * 3. The VPN key icon appears to inform the user
-     */
-    private fun startProxy() {
+    private fun startVpn() {
         if (isRunning) return
-
         try {
-            // Create a minimal VPN interface for protect() support and foreground service
             val builder = Builder()
-                .setSession("Trojan SOCKS5 Proxy")
+                .setSession("Trojan Proxy")
                 .addAddress("10.0.0.2", 32)
                 .addRoute("0.0.0.0", 0)
+                .addDnsServer("8.8.8.8")
                 .setMtu(1500)
 
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
@@ -109,459 +84,483 @@ class TrojanVpnService : VpnService() {
             }
 
             vpnInterface = builder.establish()
+            if (vpnInterface == null) {
+                sendError("Cannot establish VPN interface")
+                return
+            }
 
             isRunning = true
-            isActive.set(true)
-            startForeground(NOTIFICATION_ID, createNotification("Starting SOCKS5 proxy..."))
+            running.set(true)
+            startForeground(NOTIF_ID, createNotification("Connecting to $serverHost:$serverPort..."))
 
-            // Launch SOCKS5 server in a background thread
-            proxyThread = Thread({ runSocks5Server() }, "SOCKS5-Server")
-            proxyThread?.start()
+            // Start packet processing thread
+            Thread { processPackets() }.start()
 
-            Log.i(TAG, "SOCKS5 proxy starting on port $localSocksPort, Trojan server: $serverHost:$serverPort")
+            // Delayed connected notification
+            Thread {
+                Thread.sleep(1500)
+                if (running.get()) {
+                    sendBroadcast(Intent("com.proxyclient.proxy_client.VPN_CONNECTED"))
+                    updateNotification("Connected - $serverHost:$serverPort")
+                }
+            }.start()
+
+            Log.i(TAG, "VPN started, Trojan server: $serverHost:$serverPort")
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to start proxy", e)
-            sendErrorBroadcast(e.message ?: "Failed to start proxy")
-            stopProxy()
+            Log.e(TAG, "Failed to start VPN", e)
+            sendError(e.message ?: "Unknown error")
+            stopVpn()
         }
     }
 
-    /**
-     * Run the SOCKS5 proxy server main loop.
-     * Accepts client connections and spawns a thread for each.
-     */
-    private fun runSocks5Server() {
-        try {
-            serverSocket = ServerSocket(localSocksPort)
-            updateNotification("SOCKS5 proxy running on 127.0.0.1:$localSocksPort")
+    private fun processPackets() {
+        val vpnIn = FileInputStream(vpnInterface!!.fileDescriptor)
+        val vpnOut = FileOutputStream(vpnInterface!!.fileDescriptor)
+        val buffer = ByteArray(32767)
 
-            // Notify Flutter that the proxy is ready
-            sendBroadcast(Intent("com.proxyclient.proxy_client.VPN_CONNECTED"))
-
-            while (isActive.get()) {
-                try {
-                    val clientSocket = serverSocket!!.accept()
-                    Thread { handleSocks5Client(clientSocket) }.start()
-                } catch (e: Exception) {
-                    if (isActive.get()) {
-                        Log.e(TAG, "Accept error", e)
-                    }
-                }
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "SOCKS5 server error", e)
-            if (isActive.get()) {
-                sendErrorBroadcast(e.message ?: "SOCKS5 server error")
-                stopProxy()
-            }
-        }
-    }
-
-    /**
-     * Handle a single SOCKS5 client connection.
-     *
-     * SOCKS5 protocol flow:
-     * 1. Client sends greeting: VER(1) NMETHODS(1) METHODS(N)
-     * 2. Server responds: VER(1) METHOD(1) -- we choose 0x00 (no auth)
-     * 3. Client sends request: VER(1) CMD(1) RSV(1) ATYP(1) DST.ADDR(var) DST.PORT(2)
-     * 4. Server responds: VER(1) REP(1) RSV(1) ATYP(1) BND.ADDR(var) BND.PORT(2)
-     * 5. Bidirectional data relay begins
-     */
-    private fun handleSocks5Client(clientSocket: Socket) {
-        try {
-            clientSocket.soTimeout = 30000 // 30 second timeout
-            val input: InputStream = clientSocket.getInputStream()
-            val output: OutputStream = clientSocket.getOutputStream()
-
-            // --- SOCKS5 Handshake Phase ---
-
-            // Read greeting: version + nmethods + methods
-            val version = input.read()
-            if (version != 0x05) {
-                Log.w(TAG, "Invalid SOCKS version: $version, closing")
-                clientSocket.close()
-                return
-            }
-
-            val nMethods = input.read()
-            if (nMethods <= 0 || nMethods > 255) {
-                clientSocket.close()
-                return
-            }
-
-            // Read and discard method list (we always use NO AUTH)
-            val methods = ByteArray(nMethods)
-            readFully(input, methods)
-
-            // Respond: VER=5, METHOD=0x00 (NO AUTHENTICATION REQUIRED)
-            output.write(byteArrayOf(0x05, 0x00))
-            output.flush()
-
-            // --- SOCKS5 Request Phase ---
-
-            // Read request header
-            val reqVersion = input.read() // VER, should be 0x05
-            val cmd = input.read()         // CMD: 0x01=CONNECT, 0x03=UDP ASSOCIATE
-            val rsv = input.read()        // RSV, reserved
-            val addrType = input.read()    // ATYP: 0x01=IPv4, 0x03=Domain, 0x04=IPv6
-
-            if (reqVersion != 0x05) {
-                clientSocket.close()
-                return
-            }
-
-            // Parse target address
-            var targetHost: String
-            when (addrType) {
-                0x01 -> {
-                    // IPv4: 4 bytes
-                    val addr = ByteArray(4)
-                    readFully(input, addr)
-                    targetHost = addr.joinToString(".") { (it.toInt() and 0xFF).toString() }
-                }
-                0x03 -> {
-                    // Domain: 1 byte length + domain bytes
-                    val domainLen = input.read()
-                    if (domainLen <= 0 || domainLen > 255) {
-                        sendSocks5Error(output, 0x04) // Host unreachable
-                        clientSocket.close()
-                        return
-                    }
-                    val domain = ByteArray(domainLen)
-                    readFully(input, domain)
-                    targetHost = String(domain, Charsets.UTF_8)
-                }
-                0x04 -> {
-                    // IPv6: 16 bytes
-                    val addr = ByteArray(16)
-                    readFully(input, addr)
-                    targetHost = java.net.InetAddress.getByAddress(addr).hostAddress
-                }
-                else -> {
-                    sendSocks5Error(output, 0x08) // Address type not supported
-                    clientSocket.close()
-                    return
-                }
-            }
-
-            // Read target port (2 bytes, big-endian)
-            val portHigh = input.read()
-            val portLow = input.read()
-            if (portHigh < 0 || portLow < 0) {
-                clientSocket.close()
-                return
-            }
-            val targetPort = (portHigh shl 8) or portLow
-
-            Log.d(TAG, "SOCKS5 CONNECT request: $targetHost:$targetPort (cmd=$cmd)")
-
-            if (cmd == 0x01) {
-                // CONNECT command - establish Trojan connection to target
-                handleSocks5Connect(clientSocket, input, output, targetHost, targetPort)
-            } else if (cmd == 0x03) {
-                // UDP ASSOCIATE - not supported
-                sendSocks5Error(output, 0x07) // Command not supported
-                clientSocket.close()
-            } else {
-                sendSocks5Error(output, 0x07) // Command not supported
-                clientSocket.close()
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "Handle SOCKS5 client error", e)
+        while (running.get()) {
             try {
-                clientSocket.close()
-            } catch (_: Exception) {
-            }
-        }
-    }
+                val length = vpnIn.read(buffer)
+                if (length <= 0) continue
 
-    /**
-     * Handle SOCKS5 CONNECT command: establish Trojan tunnel and relay data.
-     */
-    private fun handleSocks5Connect(
-        clientSocket: Socket,
-        clientInput: InputStream,
-        clientOutput: OutputStream,
-        targetHost: String,
-        targetPort: Int
-    ) {
-        val trojanSocket = establishTrojanConnection(targetHost, targetPort)
+                val packet = buffer.copyOfRange(0, length)
+                val version = (packet[0].toInt() shr 4) and 0x0F
 
-        if (trojanSocket != null) {
-            try {
-                // Send SOCKS5 success response
-                // VER(5) REP(0x00=success) RSV(0) ATYP(1=IPv4) BND.ADDR(0.0.0.0) BND.PORT(0)
-                clientOutput.write(byteArrayOf(
-                    0x05, 0x00, 0x00, 0x01,
-                    0x00, 0x00, 0x00, 0x00,
-                    0x00, 0x00
-                ))
-                clientOutput.flush()
-
-                val trojanInput: InputStream = trojanSocket.getInputStream()
-                val trojanOutput: OutputStream = trojanSocket.getOutputStream()
-
-                // Bidirectional relay: client <-> trojan server
-                // Use two threads for full-duplex forwarding
-
-                val relayActive = java.util.concurrent.atomic.AtomicBoolean(true)
-
-                // Thread 1: client -> trojan
-                val clientToTrojan = Thread {
-                    try {
-                        val buf = ByteArray(8192)
-                        while (relayActive.get()) {
-                            val n = clientInput.read(buf)
-                            if (n <= 0) break
-                            trojanOutput.write(buf, 0, n)
-                            trojanOutput.flush()
-                        }
-                    } catch (_: Exception) {
-                    } finally {
-                        relayActive.set(false)
-                        try { trojanSocket.close() } catch (_: Exception) {}
-                        try { clientSocket.close() } catch (_: Exception) {}
-                    }
+                if (version == 4) {
+                    handleIPv4(packet, vpnOut)
                 }
-
-                // Thread 2: trojan -> client
-                val trojanToClient = Thread {
-                    try {
-                        val buf = ByteArray(8192)
-                        while (relayActive.get()) {
-                            val n = trojanInput.read(buf)
-                            if (n <= 0) break
-                            clientOutput.write(buf, 0, n)
-                            clientOutput.flush()
-                        }
-                    } catch (_: Exception) {
-                    } finally {
-                        relayActive.set(false)
-                        try { trojanSocket.close() } catch (_: Exception) {}
-                        try { clientSocket.close() } catch (_: Exception) {}
-                    }
-                }
-
-                clientToTrojan.start()
-                trojanToClient.start()
-
-                // Wait for either direction to finish
-                clientToTrojan.join()
-                // Give the other thread a moment to finish
-                Thread.sleep(500)
-                relayActive.set(false)
-
             } catch (e: Exception) {
-                Log.e(TAG, "SOCKS5 relay error: $targetHost:$targetPort", e)
-                try { trojanSocket.close() } catch (_: Exception) {}
-                try { clientSocket.close() } catch (_: Exception) {}
+                if (running.get()) Log.w(TAG, "Packet read error: ${e.message}")
             }
-        } else {
-            // Connection failed
+        }
+    }
+
+    private fun handleIPv4(packet: ByteArray, vpnOut: FileOutputStream) {
+        val ihl = (packet[0].toInt() and 0x0F) * 4
+        val totalLen = ((packet[2].toInt() and 0xFF) shl 8) or (packet[3].toInt() and 0xFF)
+        val protocol = packet[9].toInt() and 0xFF
+
+        val srcIP = intToIp(packet, 12)
+        val dstIP = intToIp(packet, 16)
+
+        when (protocol) {
+            6 -> handleTCP(packet, ihl, totalLen, srcIP, dstIP, vpnOut)
+            17 -> handleUDP(packet, ihl, totalLen, srcIP, dstIP, vpnOut)
+        }
+    }
+
+    private fun handleTCP(packet: ByteArray, ipHdrLen: Int, totalLen: Int, srcIP: String, dstIP: String, vpnOut: FileOutputStream) {
+        val tcpOff = ipHdrLen
+        val srcPort = ((packet[tcpOff].toInt() and 0xFF) shl 8) or (packet[tcpOff + 1].toInt() and 0xFF)
+        val dstPort = ((packet[tcpOff + 2].toInt() and 0xFF) shl 8) or (packet[tcpOff + 3].toInt() and 0xFF)
+        val dataOff = ((packet[tcpOff + 12].toInt() shr 4) and 0x0F) * 4
+        val flags = packet[tcpOff + 13].toInt() and 0xFF
+        val seq = ((packet[tcpOff + 4].toInt() and 0xFF) shl 24) or
+                ((packet[tcpOff + 5].toInt() and 0xFF) shl 16) or
+                ((packet[tcpOff + 6].toInt() and 0xFF) shl 8) or
+                (packet[tcpOff + 7].toInt() and 0xFF)
+        val ackNum = ((packet[tcpOff + 8].toInt() and 0xFF) shl 24) or
+                ((packet[tcpOff + 9].toInt() and 0xFF) shl 16) or
+                ((packet[tcpOff + 10].toInt() and 0xFF) shl 8) or
+                (packet[tcpOff + 11].toInt() and 0xFF)
+        val window = ((packet[tcpOff + 14].toInt() and 0xFF) shl 8) or (packet[tcpOff + 15].toInt() and 0xFF)
+
+        val syn = (flags and 0x02) != 0
+        val ack = (flags and 0x10) != 0
+        val fin = (flags and 0x01) != 0
+        val rst = (flags and 0x04) != 0
+        val psh = (flags and 0x08) != 0
+
+        val key = "$srcIP:$srcPort-$dstIP:$dstPort"
+
+        // Handle RST or FIN
+        if (rst || fin) {
+            tcpConnections[key]?.close()
+            tcpConnections.remove(key)
+            return
+        }
+
+        // SYN (new connection)
+        if (syn && !ack) {
             try {
-                sendSocks5Error(clientOutput, 0x01) // General SOCKS server failure
-                clientSocket.close()
-            } catch (_: Exception) {}
+                val tunnel = TcpTunnel(serverHost, serverPort, password, sni, dstIP, dstPort, this)
+                tcpConnections[key] = tunnel
+
+                // Send SYN-ACK to client
+                val mySeq = seqCounter.incrementAndGet()
+                val synAckPacket = buildTcpPacket(
+                    srcIP = dstIP, dstIP = srcIP,
+                    srcPort = dstPort, dstPort = srcPort,
+                    seq = mySeq, ack = seq + 1,
+                    syn = true, ack = true,
+                    window = 65535
+                )
+                vpnOut.write(synAckPacket)
+                vpnOut.flush()
+                tunnel.clientAck = seq + 1
+                tunnel.serverSeq = mySeq + 1
+            } catch (e: Exception) {
+                Log.e(TAG, "TCP connect failed: $dstIP:$dstPort - ${e.message}")
+                // Send RST
+                val rstPacket = buildTcpPacket(
+                    srcIP = dstIP, dstIP = srcIP,
+                    srcPort = dstPort, dstPort = srcPort,
+                    seq = 0, ack = seq + 1,
+                    rst = true
+                )
+                vpnOut.write(rstPacket)
+                vpnOut.flush()
+            }
+            return
+        }
+
+        // ACK with data (existing connection)
+        val tunnel = tcpConnections[key]
+        if (tunnel != null && ack) {
+            val payloadLen = totalLen - ipHdrLen - dataOff
+            if (payloadLen > 0) {
+                val payload = packet.copyOfRange(ipHdrLen + dataOff, totalLen)
+                tunnel.clientAck = ackNum
+                tunnel.sendData(payload)
+
+                // Read response and send back
+                Thread {
+                    try {
+                        val response = tunnel.readResponse(3000)
+                        if (response != null && response.isNotEmpty()) {
+                            val respPacket = buildTcpPacket(
+                                srcIP = dstIP, dstIP = srcIP,
+                                srcPort = dstPort, dstPort = srcPort,
+                                seq = tunnel.serverSeq,
+                                ack = tunnel.clientAck + payloadLen,
+                                psh = true,
+                                payload = response
+                            )
+                            synchronized(vpnOut) {
+                                vpnOut.write(respPacket)
+                                vpnOut.flush()
+                            }
+                            tunnel.serverSeq += response.size
+                        }
+                    } catch (e: Exception) {
+                        Log.w(TAG, "Response read error: ${e.message}")
+                    }
+                }.start()
+            }
         }
     }
 
-    /**
-     * Establish a Trojan protocol connection to the remote server.
-     *
-     * Trojan protocol:
-     * 1. TLS handshake with SNI
-     * 2. Send: password + CRLF + target_address + CRLF
-     * 3. Subsequent data is raw payload (bidirectional)
-     *
-     * Target address format (SOCKS5-like):
-     * - ATYP 0x03 (domain): 1 byte len + domain bytes
-     * - Port: 2 bytes big-endian
-     */
-    private fun establishTrojanConnection(targetHost: String, targetPort: Int): SSLSocket? {
-        return try {
-            // Create SSL context that trusts all certificates (self-signed server)
-            val sslContext = SSLContext.getInstance("TLS")
-            sslContext.init(
-                null,
-                arrayOf(TrustAllX509TrustManager()),
-                SecureRandom()
-            )
+    private fun handleUDP(packet: ByteArray, ipHdrLen: Int, totalLen: Int, srcIP: String, dstIP: String, vpnOut: FileOutputStream) {
+        val udpOff = ipHdrLen
+        val srcPort = ((packet[udpOff].toInt() and 0xFF) shl 8) or (packet[udpOff + 1].toInt() and 0xFF)
+        val dstPort = ((packet[udpOff + 2].toInt() and 0xFF) shl 8) or (packet[udpOff + 3].toInt() and 0xFF)
+        val udpLen = ((packet[udpOff + 4].toInt() and 0xFF) shl 8) or (packet[udpOff + 5].toInt() and 0xFF)
 
-            // Create raw TCP socket
-            val rawSocket = Socket()
-            rawSocket.soTimeout = 15000 // 15 second connect timeout
+        // Only handle DNS (port 53)
+        if (dstPort != 53) return
 
-            // Protect this socket from VPN routing to prevent loopback
-            protect(rawSocket)
+        val dnsPayload = packet.copyOfRange(ipHdrLen + 8, totalLen)
 
-            rawSocket.connect(InetSocketAddress(serverHost, serverPort), 15000)
-            rawSocket.soTimeout = 0 // Reset to blocking mode for data transfer
+        Thread {
+            try {
+                val tunnel = TcpTunnel(serverHost, serverPort, password, sni, dstIP, dstPort, this)
+                val response = tunnel.sendAndReceive(dnsPayload)
+                tunnel.close()
 
-            // Wrap with TLS
-            val tlsSocket = sslContext.socketFactory.createSocket(
-                rawSocket, serverHost, serverPort, true
-            ) as SSLSocket
+                if (response != null && response.isNotEmpty()) {
+                    val newUdpLen = 8 + response.size
+                    val newIpLen = ipHdrLen + newUdpLen
+                    val respPacket = ByteArray(newIpLen)
 
-            // Set SNI hostname
-            val sslParams = tlsSocket.sslParameters
-            sslParams.serverNames = listOf(SNIHostName(tlsSni))
-            tlsSocket.sslParameters = sslParams
+                    // Copy IP header
+                    System.arraycopy(packet, 0, respPacket, 0, ipHdrLen)
+                    // Swap IPs
+                    System.arraycopy(packet, 12, respPacket, 16, 4)
+                    System.arraycopy(packet, 16, respPacket, 12, 4)
+                    // Update total length
+                    respPacket[2] = ((newIpLen shr 8) and 0xFF).toByte()
+                    respPacket[3] = (newIpLen and 0xFF).toByte()
+                    // Recalculate IP checksum
+                    respPacket[10] = 0
+                    respPacket[11] = 0
+                    val ipCksum = checksum(respPacket, 0, ipHdrLen)
+                    respPacket[10] = ((ipCksum shr 8) and 0xFF).toByte()
+                    respPacket[11] = (ipCksum and 0xFF).toByte()
 
-            // Perform TLS handshake
-            tlsSocket.startHandshake()
+                    // UDP header
+                    respPacket[ipHdrLen] = ((dstPort shr 8) and 0xFF).toByte()
+                    respPacket[ipHdrLen + 1] = (dstPort and 0xFF).toByte()
+                    respPacket[ipHdrLen + 2] = ((srcPort shr 8) and 0xFF).toByte()
+                    respPacket[ipHdrLen + 3] = (srcPort and 0xFF).toByte()
+                    respPacket[ipHdrLen + 4] = ((newUdpLen shr 8) and 0xFF).toByte()
+                    respPacket[ipHdrLen + 5] = (newUdpLen and 0xFF).toByte()
+                    respPacket[ipHdrLen + 6] = 0
+                    respPacket[ipHdrLen + 7] = 0
+                    // UDP checksum
+                    val udpCksum = checksum(respPacket, ipHdrLen, newUdpLen)
+                    respPacket[ipHdrLen + 6] = ((udpCksum shr 8) and 0xFF).toByte()
+                    respPacket[ipHdrLen + 7] = (udpCksum and 0xFF).toByte()
 
-            // Send Trojan protocol header
-            val out = tlsSocket.outputStream
+                    // DNS payload
+                    System.arraycopy(response, 0, respPacket, ipHdrLen + 8, response.size)
 
-            // password + CRLF
-            val passwordBytes = trojanPassword.toByteArray(Charsets.UTF_8)
-            out.write(passwordBytes)
-            out.write(0x0D) // CR
-            out.write(0x0A) // LF
+                    synchronized(vpnOut) {
+                        vpnOut.write(respPacket)
+                        vpnOut.flush()
+                    }
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "DNS query failed: ${e.message}")
+            }
+        }.start()
+    }
 
-            // Target address: ATYP(0x03=domain) + length + domain + port(2 bytes) + CRLF
-            out.write(0x03) // ATYP: domain name
-            val hostBytes = targetHost.toByteArray(Charsets.UTF_8)
-            out.write(hostBytes.size) // domain length
-            out.write(hostBytes) // domain
-            out.write((targetPort shr 8) and 0xFF) // port high byte
-            out.write(targetPort and 0xFF) // port low byte
-            out.write(0x0D) // CR
-            out.write(0x0A) // LF
-            out.flush()
+    private fun buildTcpPacket(
+        srcIP: String, dstIP: String,
+        srcPort: Int, dstPort: Int,
+        seq: Int, ack: Int,
+        syn: Boolean = false, ackFlag: Boolean = false,
+        fin: Boolean = false, rst: Boolean = false,
+        psh: Boolean = false,
+        window: Int = 65535,
+        payload: ByteArray? = null
+    ): ByteArray {
+        val ipHdrLen = 20
+        val tcpHdrLen = 20
+        val payloadLen = payload?.size ?: 0
+        val totalLen = ipHdrLen + tcpHdrLen + payloadLen
+        val pkt = ByteArray(totalLen)
 
-            Log.d(TAG, "Trojan connection established: $targetHost:$targetPort via $serverHost:$serverPort")
-            tlsSocket
-        } catch (e: Exception) {
-            Log.e(TAG, "Trojan connection failed: $targetHost:$targetPort", e)
-            null
+        // IP header
+        pkt[0] = 0x45 // version 4, IHL 5
+        pkt[1] = 0x00 // TOS
+        pkt[2] = ((totalLen shr 8) and 0xFF).toByte()
+        pkt[3] = (totalLen and 0xFF).toByte()
+        // ID, flags, fragment offset = 0
+        pkt[8] = 64  // TTL
+        pkt[9] = 6   // TCP
+
+        val srcBytes = srcIP.split(".").map { it.toInt().toByte() }.toByteArray()
+        val dstBytes = dstIP.split(".").map { it.toInt().toByte() }.toByteArray()
+        System.arraycopy(srcBytes, 0, pkt, 12, 4)
+        System.arraycopy(dstBytes, 0, pkt, 16, 4)
+
+        // IP checksum
+        val ipCksum = checksum(pkt, 0, ipHdrLen)
+        pkt[10] = ((ipCksum shr 8) and 0xFF).toByte()
+        pkt[11] = (ipCksum and 0xFF).toByte()
+
+        // TCP header
+        pkt[ipHdrLen] = ((srcPort shr 8) and 0xFF).toByte()
+        pkt[ipHdrLen + 1] = (srcPort and 0xFF).toByte()
+        pkt[ipHdrLen + 2] = ((dstPort shr 8) and 0xFF).toByte()
+        pkt[ipHdrLen + 3] = (dstPort and 0xFF).toByte()
+        pkt[ipHdrLen + 4] = ((seq shr 24) and 0xFF).toByte()
+        pkt[ipHdrLen + 5] = ((seq shr 16) and 0xFF).toByte()
+        pkt[ipHdrLen + 6] = ((seq shr 8) and 0xFF).toByte()
+        pkt[ipHdrLen + 7] = (seq and 0xFF).toByte()
+        pkt[ipHdrLen + 8] = ((ack shr 24) and 0xFF).toByte()
+        pkt[ipHdrLen + 9] = ((ack shr 16) and 0xFF).toByte()
+        pkt[ipHdrLen + 10] = ((ack shr 8) and 0xFF).toByte()
+        pkt[ipHdrLen + 11] = (ack and 0xFF).toByte()
+        pkt[ipHdrLen + 12] = ((tcpHdrLen shr 4) shl 4).toByte() // data offset
+        var tcpFlags = 0
+        if (syn) tcpFlags = tcpFlags or 0x02
+        if (ackFlag) tcpFlags = tcpFlags or 0x10
+        if (fin) tcpFlags = tcpFlags or 0x01
+        if (rst) tcpFlags = tcpFlags or 0x04
+        if (psh) tcpFlags = tcpFlags or 0x08
+        pkt[ipHdrLen + 13] = tcpFlags.toByte()
+        pkt[ipHdrLen + 14] = ((window shr 8) and 0xFF).toByte()
+        pkt[ipHdrLen + 15] = (window and 0xFF).toByte()
+
+        // TCP checksum (with pseudo header)
+        if (payload != null) {
+            System.arraycopy(payload, 0, pkt, ipHdrLen + tcpHdrLen, payloadLen)
         }
+        val tcpCksum = tcpChecksum(pkt, srcBytes, dstBytes, ipHdrLen, tcpHdrLen + payloadLen)
+        pkt[ipHdrLen + 16] = ((tcpCksum shr 8) and 0xFF).toByte()
+        pkt[ipHdrLen + 17] = (tcpCksum and 0xFF).toByte()
+
+        return pkt
     }
 
-    /**
-     * Send a SOCKS5 error response to the client.
-     */
-    private fun sendSocks5Error(output: OutputStream, repCode: Byte) {
-        try {
-            output.write(byteArrayOf(
-                0x05,       // VER
-                repCode,    // REP (error code)
-                0x00,       // RSV
-                0x01,       // ATYP: IPv4
-                0x00, 0x00, 0x00, 0x00,  // BND.ADDR: 0.0.0.0
-                0x00, 0x00  // BND.PORT: 0
-            ))
-            output.flush()
-        } catch (_: Exception) {}
-    }
-
-    /**
-     * Read exactly `length` bytes from the input stream.
-     * Throws IOException if the stream ends before all bytes are read.
-     */
-    private fun readFully(input: InputStream, buffer: ByteArray) {
-        var offset = 0
-        while (offset < buffer.size) {
-            val n = input.read(buffer, offset, buffer.size - offset)
-            if (n <= 0) throw java.io.IOException("Unexpected end of stream")
-            offset += n
+    private fun checksum(data: ByteArray, offset: Int, length: Int): Int {
+        var sum = 0
+        var i = offset
+        while (i < length - 1) {
+            sum += ((data[i].toInt() and 0xFF) shl 8) or (data[i + 1].toInt() and 0xFF)
+            i += 2
         }
+        if (length % 2 != 0) {
+            sum += (data[length - 1].toInt() and 0xFF) shl 8
+        }
+        while (sum shr 16 != 0) {
+            sum = (sum and 0xFFFF) + (sum shr 16)
+        }
+        return sum.inv() and 0xFFFF
     }
 
-    /**
-     * Stop the proxy server and clean up all resources.
-     */
-    private fun stopProxy() {
-        isActive.set(false)
+    private fun tcpChecksum(pkt: ByteArray, srcIP: ByteArray, dstIP: ByteArray, tcpOffset: Int, tcpLen: Int): Int {
+        // Pseudo header: srcIP(4) + dstIP(4) + zero(1) + protocol(1) + tcpLen(2)
+        val pseudo = ByteArray(12 + tcpLen)
+        System.arraycopy(srcIP, 0, pseudo, 0, 4)
+        System.arraycopy(dstIP, 0, pseudo, 4, 4)
+        pseudo[8] = 0
+        pseudo[9] = 6 // TCP
+        pseudo[10] = ((tcpLen shr 8) and 0xFF).toByte()
+        pseudo[11] = (tcpLen and 0xFF).toByte()
+        System.arraycopy(pkt, tcpOffset, pseudo, 12, tcpLen)
+        return checksum(pseudo, 0, pseudo.size)
+    }
+
+    private fun intToIp(pkt: ByteArray, offset: Int): String {
+        return "${pkt[offset].toInt() and 0xFF}.${pkt[offset + 1].toInt() and 0xFF}.${pkt[offset + 2].toInt() and 0xFF}.${pkt[offset + 3].toInt() and 0xFF}"
+    }
+
+    private fun stopVpn() {
+        running.set(false)
         isRunning = false
-
-        // Close server socket (will unblock accept())
-        try {
-            serverSocket?.close()
-        } catch (_: Exception) {}
-        serverSocket = null
-
-        // Close VPN interface
-        try {
-            vpnInterface?.close()
-        } catch (_: Exception) {}
+        tcpConnections.values.forEach { it.close() }
+        tcpConnections.clear()
+        try { vpnInterface?.close() } catch (_: Exception) {}
         vpnInterface = null
-
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
-
         sendBroadcast(Intent("com.proxyclient.proxy_client.VPN_DISCONNECTED"))
-        Log.i(TAG, "SOCKS5 proxy stopped")
     }
 
-    private fun sendErrorBroadcast(message: String) {
+    private fun sendError(msg: String) {
         sendBroadcast(Intent("com.proxyclient.proxy_client.VPN_ERROR").apply {
-            putExtra("errorMessage", message)
+            putExtra("errorMessage", msg)
         })
     }
 
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val channel = NotificationChannel(
-                NOTIFICATION_CHANNEL_ID,
-                "Trojan SOCKS5 Proxy",
-                NotificationManager.IMPORTANCE_LOW
-            ).apply {
-                description = "SOCKS5 proxy service with Trojan protocol forwarding"
-                setShowBadge(false)
-            }
-            val nm = getSystemService(NotificationManager::class.java)
-            nm.createNotificationChannel(channel)
+            val ch = NotificationChannel(CHANNEL_ID, "Trojan VPN", NotificationManager.IMPORTANCE_LOW)
+            getSystemService(NotificationManager::class.java).createNotificationChannel(ch)
         }
     }
 
     private fun createNotification(text: String): Notification {
-        val pendingIntent = PendingIntent.getActivity(
-            this, 0,
+        val pi = PendingIntent.getActivity(this, 0,
             Intent(this, MainActivity::class.java),
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-        )
-
-        val disconnectIntent = Intent(this, TrojanVpnService::class.java).apply {
-            action = ACTION_DISCONNECT
-        }
-        val disconnectPendingIntent = PendingIntent.getService(
-            this, 1, disconnectIntent,
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-        )
-
-        return NotificationCompat.Builder(this, NOTIFICATION_CHANNEL_ID)
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
+        return NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("Proxy Client")
             .setContentText(text)
             .setSmallIcon(android.R.drawable.ic_menu_compass)
-            .setContentIntent(pendingIntent)
+            .setContentIntent(pi)
             .setOngoing(true)
-            .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
-            .addAction(
-                android.R.drawable.ic_menu_close_clear_cancel,
-                "Stop",
-                disconnectPendingIntent
-            )
             .build()
     }
 
     private fun updateNotification(text: String) {
-        val nm = getSystemService(NotificationManager::class.java)
-        nm.notify(NOTIFICATION_ID, createNotification(text))
-    }
-
-    /**
-     * Trust-all X509TrustManager for self-signed TLS certificates.
-     * WARNING: This accepts all certificates. In production, pin the server certificate.
-     */
-    private class TrustAllX509TrustManager : X509TrustManager {
-        override fun checkClientTrusted(chain: Array<X509Certificate>?, authType: String?) {}
-        override fun checkServerTrusted(chain: Array<X509Certificate>?, authType: String?) {}
-        override fun getAcceptedIssuers(): Array<X509Certificate> = arrayOf()
+        getSystemService(NotificationManager::class.java).notify(NOTIF_ID, createNotification(text))
     }
 
     override fun onDestroy() {
-        stopProxy()
+        stopVpn()
         super.onDestroy()
+    }
+
+    /**
+     * TCP tunnel: establishes a Trojan connection to the target through the proxy server.
+     */
+    class TcpTunnel(
+        private val proxyHost: String,
+        private val proxyPort: Int,
+        private val password: String,
+        private val sni: String,
+        private val targetHost: String,
+        private val targetPort: Int,
+        private val vpnService: VpnService
+    ) {
+        var clientAck = 0
+        var serverSeq = 0
+        private var socket: SSLSocket? = null
+        private val buffer = java.io.ByteArrayOutputStream()
+
+        fun sendData(data: ByteArray) {
+            try {
+                if (socket == null || socket!!.isClosed) {
+                    connect()
+                }
+                socket!!.outputStream.write(data)
+                socket!!.outputStream.flush()
+            } catch (e: Exception) {
+                Log.e(TAG, "Send data error: ${e.message}")
+            }
+        }
+
+        fun readResponse(timeoutMs: Int = 5000): ByteArray? {
+            return try {
+                if (socket == null || socket!!.isClosed) return null
+                socket!!.soTimeout = timeoutMs
+                val buf = ByteArray(65535)
+                val n = socket!!.inputStream.read(buf)
+                if (n > 0) buf.copyOfRange(0, n) else null
+            } catch (e: Exception) {
+                null
+            }
+        }
+
+        fun sendAndReceive(data: ByteArray): ByteArray? {
+            return try {
+                if (socket == null || socket!!.isClosed) connect()
+                socket!!.outputStream.write(data)
+                socket!!.outputStream.flush()
+                socket!!.soTimeout = 5000
+                val buf = ByteArray(65535)
+                val n = socket!!.inputStream.read(buf)
+                if (n > 0) buf.copyOfRange(0, n) else null
+            } catch (e: Exception) {
+                Log.w(TAG, "sendAndReceive error: ${e.message}")
+                null
+            }
+        }
+
+        private fun connect() {
+            val ctx = SSLContext.getInstance("TLS")
+            ctx.init(null, arrayOf(TrustAllManager), java.security.SecureRandom())
+
+            val rawSocket = Socket()
+            vpnService.protect(rawSocket)
+            rawSocket.connect(InetSocketAddress(proxyHost, proxyPort), 10000)
+            rawSocket.tcpNoDelay = true
+
+            val tls = ctx.socketFactory.createSocket(rawSocket, proxyHost, proxyPort, true) as SSLSocket
+            val params = tls.sslParameters
+            params.serverNames = listOf(SNIHostName(sni))
+            tls.sslParameters = params
+            tls.startHandshake()
+
+            // Trojan handshake: password\r\n + target_addr\r\n
+            val out = tls.outputStream
+            out.write(password.toByteArray(Charsets.UTF_8))
+            out.write("\r\n".toByteArray())
+            // Target in SOCKS5-like format
+            out.write(0x03) // ATYPE_DOMAIN
+            out.write(targetHost.length)
+            out.write(targetHost.toByteArray(Charsets.UTF_8))
+            out.write((targetPort shr 8).toByte())
+            out.write((targetPort and 0xFF).toByte())
+            out.write("\r\n".toByteArray())
+            out.flush()
+
+            socket = tls
+        }
+
+        fun close() {
+            try { socket?.close() } catch (_: Exception) {}
+            socket = null
+        }
+    }
+
+    private object TrustAllManager : X509TrustManager {
+        override fun checkClientTrusted(chain: Array<java.security.cert.X509Certificate>?, authType: String?) {}
+        override fun checkServerTrusted(chain: Array<java.security.cert.X509Certificate>?, authType: String?) {}
+        override fun getAcceptedIssuers(): Array<java.security.cert.X509Certificate> = arrayOf()
     }
 }
