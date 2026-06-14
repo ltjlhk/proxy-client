@@ -54,7 +54,7 @@ class HomeScreen extends StatelessWidget {
                             const SizedBox(width: 6),
                             Text(
                               vpn.isConnected
-                                  ? 'Connected'
+                                  ? 'SOCKS5 Ready'
                                   : vpn.isConnecting
                                       ? 'Connecting'
                                       : 'Disconnected',
@@ -152,6 +152,51 @@ class HomeScreen extends StatelessWidget {
             ),
 
             const Spacer(),
+
+            // Proxy configuration hint
+            Consumer<VpnProvider>(
+              builder: (context, vpn, child) {
+                if (vpn.isConnected) {
+                  return Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 40),
+                    child: Container(
+                      padding: const EdgeInsets.all(12),
+                      decoration: BoxDecoration(
+                        color: const Color(0xFF161B22),
+                        borderRadius: BorderRadius.circular(12),
+                        border: Border.all(
+                          color: const Color(0xFF238636),
+                          width: 1,
+                        ),
+                      ),
+                      child: Row(
+                        children: [
+                          const Icon(
+                            Icons.info_outline,
+                            size: 18,
+                            color: Color(0xFF58A6FF),
+                          ),
+                          const SizedBox(width: 10),
+                          Expanded(
+                            child: Text(
+                              'SOCKS5 proxy: 127.0.0.1:7890\nPlease set this in WiFi proxy settings',
+                              style: const TextStyle(
+                                fontSize: 12,
+                                color: Color(0xFF8B949E),
+                                height: 1.4,
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  );
+                }
+                return const SizedBox.shrink();
+              },
+            ),
+
+            const SizedBox(height: 20),
 
             // Traffic stats
             Consumer<VpnProvider>(

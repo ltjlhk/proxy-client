@@ -24,6 +24,11 @@ class VpnProvider extends ChangeNotifier {
   final String trojanPassword = 'proxy123456';
   final String tlsSni = 'proxy.local';
 
+  // SOCKS5 proxy info
+  static const String socks5Address = '127.0.0.1';
+  static const int socks5Port = 7890;
+  String get proxyInfo => 'SOCKS5 $socks5Address:$socks5Port';
+
   VpnStatus get status => _status;
   String get errorMessage => _errorMessage;
   bool get isConnected => _status == VpnStatus.connected;
