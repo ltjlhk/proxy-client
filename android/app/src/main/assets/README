@@ -1,0 +1,13 @@
+# Assets Directory
+
+This directory contains assets that are bundled into the APK.
+
+## sing-box binary
+
+The `sing-box` binary is downloaded during CI build from:
+https://github.com/SagerNet/sing-box/releases/download/v1.10.7/sing-box-1.10.7-android-arm64.tar.gz
+
+It is NOT committed to the repository. The GitHub Actions workflow downloads it
+automatically before building the APK.
+
+If building locally, download the Android ARM64 binary manually and place it here as `sing-box`.

@@ -22,3 +22,6 @@ Pods/
 
 # macOS
 .DS_Store
+
+# sing-box binary (downloaded during CI build)
+android/app/src/main/assets/sing-box

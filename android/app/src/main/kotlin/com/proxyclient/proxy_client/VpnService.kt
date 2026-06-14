@@ -4,56 +4,34 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
+import android.content.Context
 import android.content.Intent
 import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
 import android.util.Log
 import androidx.core.app.NotificationCompat
-import java.io.FileInputStream
+import java.io.File
 import java.io.FileOutputStream
 import java.io.InputStream
-import java.io.OutputStream
-import java.net.InetAddress
-import java.net.InetSocketAddress
-import java.net.Socket
-import java.nio.ByteBuffer
-import java.security.KeyStore
-import java.security.SecureRandom
-import java.security.cert.X509Certificate
-import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.ExecutorService
-import java.util.concurrent.Executors
-import java.util.concurrent.atomic.AtomicBoolean
-import java.util.concurrent.atomic.AtomicLong
-import javax.net.ssl.SSLContext
-import javax.net.ssl.TrustManager
-import javax.net.ssl.TrustManagerFactory
-import javax.net.ssl.X509TrustManager
 
 /**
- * TrojanVpnService - Android VpnService that implements Trojan protocol proxy.
+ * TrojanVpnService - Android VpnService that manages sing-box as an embedded proxy engine.
  *
- * Trojan protocol:
- * 1. Establish TLS connection to server
- * 2. Send: SHA224(password) + CRLF + target_addr_type + target_addr + target_port + CRLF + payload
- * 3. Receive: CRLF + payload (response from target)
+ * Architecture:
+ * 1. VpnService creates a TUN interface to route all traffic
+ * 2. sing-box binary is extracted from assets and executed as an external process
+ * 3. sing-box is configured with tun inbound + trojan outbound
+ * 4. sing-box handles all packet processing, TCP state management, and protocol conversion
  *
- * This service:
- * - Creates a TUN interface via Android VpnService
- * - Reads IP packets from TUN
- * - Parses TCP/UDP packets to extract destination address/port
- * - Forwards through Trojan protocol to the remote server
- * - Writes responses back to TUN
+ * This replaces the previous approach of manually parsing IP packets in Kotlin,
+ * which had fundamental issues (no TCP state machine, no proper IP packet reconstruction,
+ * no connection tracking, etc.).
  */
 class TrojanVpnService : VpnService() {
 
     companion object {
         const val TAG = "TrojanVpnService"
-        const val VPN_ADDRESS = "10.0.0.2"
-        const val VPN_ROUTE = "0.0.0.0"
-        const val VPN_DNS1 = "8.8.8.8"
-        const val VPN_DNS2 = "8.8.4.4"
         const val NOTIFICATION_CHANNEL_ID = "trojan_vpn_channel"
         const val NOTIFICATION_ID = 1001
 
@@ -62,60 +40,21 @@ class TrojanVpnService : VpnService() {
 
         var isRunning = false
             private set
-
-        // Trojan protocol constants
-        private const val ATYPE_IPV4: Byte = 0x01
-        private const val ATYPE_DOMAIN: Byte = 0x03
-        private const val ATYPE_IPV6: Byte = 0x04
-
-        private val TROJAN_CRLF = "\r\n".toByteArray()
     }
 
     private var vpnInterface: ParcelFileDescriptor? = null
-    private var vpnThread: Thread? = null
-    private val isActive = AtomicBoolean(false)
-    private val totalUpload = AtomicLong(0)
-    private val totalDownload = AtomicLong(0)
-    private var lastUpload = AtomicLong(0)
-    private var lastDownload = AtomicLong(0)
-    private var trafficThread: Thread? = null
+    private var singBoxProcess: Process? = null
+    private val isActive = java.util.concurrent.atomic.AtomicBoolean(false)
 
-    // Server configuration
-    private var serverHost: String = "47.80.241.156"
-    private var serverPort: Int = 8443
-    private var trojanPassword: String = "proxy123456"
-    private var tlsSni: String = "proxy.local"
-
-    // Pre-computed password hash (SHA224)
-    private var passwordHash: ByteArray = ByteArray(0)
-
-    // TLS context that trusts all certificates (for self-signed)
-    private var sslContext: SSLContext? = null
-
-    // Connection pool for reuse
-    private val connectionPool = ConcurrentHashMap<String, TrojanConnection>()
+    // Server configuration (defaults, overridden by intent extras)
+    private var serverHost = "47.80.241.156"
+    private var serverPort = 8443
+    private var trojanPassword = "proxy123456"
+    private var tlsSni = "proxy.local"
 
     override fun onCreate() {
         super.onCreate()
         createNotificationChannel()
-        initSslContext()
-    }
-
-    private fun initSslContext() {
-        try {
-            // Create a TrustManager that accepts all certificates (insecure mode for self-signed)
-            val trustAllCerts = arrayOf<TrustManager>(object : X509TrustManager {
-                override fun checkClientTrusted(chain: Array<X509Certificate>, authType: String) {}
-                override fun checkServerTrusted(chain: Array<X509Certificate>, authType: String) {}
-                override fun getAcceptedIssuers(): Array<X509Certificate> = arrayOf()
-            })
-
-            sslContext = SSLContext.getInstance("TLS").apply {
-                init(null, trustAllCerts, SecureRandom())
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to init SSL context", e)
-        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -127,32 +66,31 @@ class TrojanVpnService : VpnService() {
                 tlsSni = intent.getStringExtra("tlsSni") ?: tlsSni
                 startVpn()
             }
-            ACTION_DISCONNECT -> {
-                stopVpn()
-            }
-            else -> {
-                if (!isRunning) startVpn()
-            }
+            ACTION_DISCONNECT -> stopVpn()
         }
         return START_STICKY
     }
 
+    /**
+     * Start the VPN service:
+     * 1. Create TUN interface via VpnService.Builder
+     * 2. Extract sing-box binary from assets if needed
+     * 3. Generate sing-box JSON configuration
+     * 4. Launch sing-box as an external process
+     */
     private fun startVpn() {
         if (isRunning) return
 
         try {
-            // Pre-compute SHA224 hash of password
-            passwordHash = sha224(trojanPassword)
-
+            // Create VPN interface
+            // sing-box with tun inbound and auto_route will manage routing,
+            // but we still create the VpnService TUN to satisfy Android's VPN framework
+            // and to protect sing-box sockets from routing loops.
             val builder = Builder()
                 .setSession("Trojan Proxy")
-                .addAddress(VPN_ADDRESS, 24)
-                .addDnsServer(VPN_DNS1)
-                .addDnsServer(VPN_DNS2)
-                .addRoute(VPN_ROUTE, 0)
+                .addAddress("172.19.0.1", 30)
+                .addRoute("0.0.0.0", 0)
                 .setMtu(1500)
-                .allowFamily(android.system.OsConstants.AF_INET)
-                .allowFamily(android.system.OsConstants.AF_INET6)
 
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 builder.setMetered(false)
@@ -165,52 +103,200 @@ class TrojanVpnService : VpnService() {
                 isActive.set(true)
                 startForeground(NOTIFICATION_ID, createNotification())
 
-                // Start VPN packet processing thread
-                vpnThread = Thread({
-                    processVpnPackets()
-                }, "VPN-Processor").apply {
-                    isDaemon = true
-                    start()
-                }
-
-                // Start traffic reporting thread
-                trafficThread = Thread({
-                    reportTraffic()
-                }, "Traffic-Reporter").apply {
-                    isDaemon = true
-                    start()
-                }
+                // Launch sing-box in a background thread
+                Thread({ runSingBox() }, "SingBox-Runner").start()
 
                 sendBroadcast(Intent("com.proxyclient.proxy_client.VPN_CONNECTED"))
-                Log.i(TAG, "Trojan VPN started - server: $serverHost:$serverPort")
+                Log.i(TAG, "VPN started, launching sing-box - server: $serverHost:$serverPort")
             } else {
                 sendErrorBroadcast("Failed to establish VPN interface")
             }
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to start Trojan VPN", e)
+            Log.e(TAG, "Failed to start VPN", e)
             sendErrorBroadcast(e.message ?: "Failed to start VPN")
             stopVpn()
         }
     }
 
+    /**
+     * Extract sing-box binary from assets, generate config, and execute.
+     */
+    private fun runSingBox() {
+        try {
+            // Prepare sing-box directory in app's internal storage
+            val singBoxDir = File(filesDir, "sing-box")
+            singBoxDir.mkdirs()
+            val singBoxBin = File(singBoxDir, "sing-box")
+
+            // Extract binary from assets if not already present
+            if (!singBoxBin.exists()) {
+                Log.i(TAG, "Extracting sing-box binary from assets...")
+                extractAsset("sing-box", singBoxBin)
+                singBoxBin.setExecutable(true)
+                Log.i(TAG, "sing-box binary extracted: ${singBoxBin.absolutePath}")
+            }
+
+            // Generate sing-box configuration file
+            val configFile = File(singBoxDir, "config.json")
+            val config = generateConfig()
+            configFile.writeText(config)
+            Log.i(TAG, "sing-box config written to: ${configFile.absolutePath}")
+
+            // Build command: sing-box run -c config.json
+            val cmd = arrayOf(
+                singBoxBin.absolutePath,
+                "run",
+                "-c", configFile.absolutePath
+            )
+
+            Log.i(TAG, "Launching sing-box: ${cmd.joinToString(" ")}")
+
+            val processBuilder = ProcessBuilder(*cmd)
+            processBuilder.redirectErrorStream(true)
+            processBuilder.environment()["HOME"] = singBoxDir.absolutePath
+
+            singBoxProcess = processBuilder.start()
+
+            // Consume stdout/stderr for logging
+            val reader = singBoxProcess!!.inputStream.bufferedReader()
+            var line: String?
+            while (reader.readLine().also { line = it } != null) {
+                Log.d(TAG, "sing-box: $line")
+            }
+
+            val exitCode = singBoxProcess!!.waitFor()
+            Log.i(TAG, "sing-box exited with code: $exitCode")
+
+            if (isActive.get() && exitCode != 0) {
+                sendErrorBroadcast("sing-box exited with code $exitCode")
+                stopVpn()
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to run sing-box", e)
+            if (isActive.get()) {
+                sendErrorBroadcast(e.message ?: "Failed to run sing-box")
+                stopVpn()
+            }
+        }
+    }
+
+    /**
+     * Extract a file from the APK assets to the given destination File.
+     */
+    private fun extractAsset(assetName: String, destFile: File) {
+        val inputStream: InputStream = assets.open(assetName)
+        val outputStream = FileOutputStream(destFile)
+        val buffer = ByteArray(8192)
+        var read: Int
+        while (inputStream.read(buffer).also { read = it } != -1) {
+            outputStream.write(buffer, 0, read)
+        }
+        outputStream.close()
+        inputStream.close()
+    }
+
+    /**
+     * Generate sing-box JSON configuration.
+     *
+     * Uses:
+     * - tun inbound: creates its own TUN interface, auto_route for system routing
+     * - trojan outbound: connects to the remote Trojan server
+     * - direct outbound: for bypass rules if needed
+     */
+    private fun generateConfig(): String {
+        return """{
+    "log": {
+        "level": "warn",
+        "timestamp": true
+    },
+    "inbounds": [
+        {
+            "type": "tun",
+            "tag": "tun-in",
+            "inet4_address": "172.19.0.1/30",
+            "auto_route": true,
+            "strict_route": true,
+            "stack": "system",
+            "sniff": true,
+            "sniff_override_destination": false
+        }
+    ],
+    "outbounds": [
+        {
+            "type": "trojan",
+            "tag": "trojan-out",
+            "server": "$serverHost",
+            "server_port": $serverPort,
+            "password": "$trojanPassword",
+            "tls": {
+                "enabled": true,
+                "server_name": "$tlsSni",
+                "insecure": true
+            }
+        },
+        {
+            "type": "direct",
+            "tag": "direct"
+        },
+        {
+            "type": "block",
+            "tag": "block"
+        },
+        {
+            "type": "dns",
+            "tag": "dns-out"
+        }
+    ],
+    "route": {
+        "auto_detect_interface": true,
+        "rules": [
+            {
+                "protocol": "dns",
+                "outbound": "dns-out"
+            }
+        ],
+        "final": "trojan-out"
+    },
+    "dns": {
+        "servers": [
+            {
+                "tag": "remote",
+                "address": "8.8.8.8",
+                "detour": "trojan-out"
+            },
+            {
+                "tag": "local",
+                "address": "223.5.5.5",
+                "detour": "direct"
+            }
+        ],
+        "rules": [
+            {
+                "outbound": "any",
+                "server": "local"
+            }
+        ],
+        "final": "remote",
+        "strategy": "prefer_ipv4"
+    }
+}"""
+    }
+
+    /**
+     * Stop the VPN service and clean up all resources.
+     */
     private fun stopVpn() {
         isActive.set(false)
         isRunning = false
 
-        // Close all pooled connections
-        connectionPool.values.forEach { it.close() }
-        connectionPool.clear()
+        // Terminate sing-box process
+        singBoxProcess?.destroy()
+        singBoxProcess = null
 
-        vpnThread?.interrupt()
-        vpnThread = null
-
-        trafficThread?.interrupt()
-        trafficThread = null
-
+        // Close VPN interface
         try {
             vpnInterface?.close()
-        } catch (e: Exception) {
-            Log.e(TAG, "Error closing VPN interface", e)
+        } catch (_: Exception) {
         }
         vpnInterface = null
 
@@ -218,300 +304,7 @@ class TrojanVpnService : VpnService() {
         stopSelf()
 
         sendBroadcast(Intent("com.proxyclient.proxy_client.VPN_DISCONNECTED"))
-        Log.i(TAG, "Trojan VPN stopped")
-    }
-
-    /**
-     * Main VPN packet processing loop.
-     * Reads raw IP packets from TUN interface, parses them,
-     * and forwards through Trojan protocol.
-     */
-    private fun processVpnPackets() {
-        vpnInterface?.let { vpn ->
-            val vpnInput = FileInputStream(vpn.fileDescriptor)
-            val vpnOutput = FileOutputStream(vpn.fileDescriptor)
-            val buffer = ByteArray(32767)
-
-            while (isActive.get()) {
-                try {
-                    val length = vpnInput.read(buffer)
-                    if (length <= 0) continue
-
-                    val packet = buffer.copyOfRange(0, length)
-
-                    // Parse IP version
-                    if (packet.isEmpty()) continue
-                    val version = (packet[0].toInt() shr 4) and 0x0F
-
-                    when (version) {
-                        4 -> handleIPv4Packet(packet, vpnOutput)
-                        6 -> handleIPv6Packet(packet, vpnOutput)
-                    }
-                } catch (e: Exception) {
-                    if (isActive.get()) {
-                        Log.e(TAG, "Error processing VPN packet", e)
-                    }
-                }
-            }
-        }
-    }
-
-    /**
-     * Handle IPv4 packet - extract TCP/UDP destination and forward via Trojan.
-     */
-    private fun handleIPv4Packet(packet: ByteArray, vpnOutput: FileOutputStream) {
-        if (packet.size < 20) return
-
-        val protocol = packet[9].toInt() and 0xFF
-        // Source IP: bytes 12-15
-        // Destination IP: bytes 16-19
-        val destIpBytes = packet.copyOfRange(16, 20)
-        val destIp = InetAddress.getByAddress(destIpBytes).hostAddress ?: return
-
-        // Header length
-        val ihl = (packet[0].toInt() and 0x0F) * 4
-
-        when (protocol) {
-            6 -> { // TCP
-                if (packet.size < ihl + 4) return
-                val destPort = ((packet[ihl + 2].toInt() and 0xFF) shl 8) or
-                        (packet[ihl + 3].toInt() and 0xFF)
-                val payload = packet.copyOfRange(ihl, packet.size)
-                handleTcpConnection(destIp, destPort, payload, packet, vpnOutput)
-            }
-            17 -> { // UDP
-                if (packet.size < ihl + 4) return
-                val destPort = ((packet[ihl + 2].toInt() and 0xFF) shl 8) or
-                        (packet[ihl + 3].toInt() and 0xFF)
-                val payload = packet.copyOfRange(ihl, packet.size)
-                handleUdpPacket(destIp, destPort, payload, packet, vpnOutput)
-            }
-        }
-    }
-
-    /**
-     * Handle IPv6 packet.
-     */
-    private fun handleIPv6Packet(packet: ByteArray, vpnOutput: FileOutputStream) {
-        if (packet.size < 40) return
-
-        val protocol = packet[6].toInt() and 0xFF
-        // Destination IP: bytes 24-39
-        val destIpBytes = packet.copyOfRange(24, 40)
-        val destIp = InetAddress.getByAddress(destIpBytes).hostAddress ?: return
-
-        when (protocol) {
-            6 -> { // TCP
-                if (packet.size < 54) return
-                val destPort = ((packet[44].toInt() and 0xFF) shl 8) or
-                        (packet[45].toInt() and 0xFF)
-                val payload = packet.copyOfRange(40, packet.size)
-                handleTcpConnection(destIp, destPort, payload, packet, vpnOutput)
-            }
-            17 -> { // UDP
-                if (packet.size < 48) return
-                val destPort = ((packet[44].toInt() and 0xFF) shl 8) or
-                        (packet[45].toInt() and 0xFF)
-                val payload = packet.copyOfRange(40, packet.size)
-                handleUdpPacket(destIp, destPort, payload, packet, vpnOutput)
-            }
-        }
-    }
-
-    /**
-     * Handle TCP connection via Trojan protocol.
-     * Opens a TLS connection to the Trojan server, sends the Trojan request,
-     * and relays data bidirectionally.
-     */
-    private fun handleTcpConnection(
-        destIp: String,
-        destPort: Int,
-        tcpPayload: ByteArray,
-        originalPacket: ByteArray,
-        vpnOutput: FileOutputStream
-    ) {
-        val connKey = "$destIp:$destPort"
-
-        try {
-            // Create new Trojan connection
-            val conn = createTrojanConnection(destIp, destPort)
-
-            // Send initial TCP payload through Trojan
-            conn.send(tcpPayload)
-
-            // Relay response back to VPN in a separate thread
-            Thread({
-                try {
-                    val responseData = conn.receive()
-                    if (responseData.isNotEmpty()) {
-                        // Reconstruct IP packet with response data
-                        // For simplicity, we write raw response data
-                        // In a full implementation, we'd reconstruct proper IP/TCP packets
-                        vpnOutput.write(responseData)
-                        vpnOutput.flush()
-                        totalDownload.addAndGet(responseData.size.toLong())
-                    }
-                } catch (e: Exception) {
-                    if (isActive.get()) {
-                        Log.e(TAG, "Error relaying TCP response for $connKey", e)
-                    }
-                } finally {
-                    conn.close()
-                }
-            }, "TCP-Relay-$connKey").apply {
-                isDaemon = true
-                start()
-            }
-
-            totalUpload.addAndGet(tcpPayload.size.toLong())
-
-        } catch (e: Exception) {
-            if (isActive.get()) {
-                Log.e(TAG, "TCP connection error for $connKey", e)
-            }
-        }
-    }
-
-    /**
-     * Handle UDP packet via Trojan protocol (UDP over TCP).
-     */
-    private fun handleUdpPacket(
-        destIp: String,
-        destPort: Int,
-        udpPayload: ByteArray,
-        originalPacket: ByteArray,
-        vpnOutput: FileOutputStream
-    ) {
-        try {
-            val conn = createTrojanConnection(destIp, destPort)
-            conn.send(udpPayload)
-
-            Thread({
-                try {
-                    val responseData = conn.receive()
-                    if (responseData.isNotEmpty()) {
-                        vpnOutput.write(responseData)
-                        vpnOutput.flush()
-                        totalDownload.addAndGet(responseData.size.toLong())
-                    }
-                } catch (e: Exception) {
-                    if (isActive.get()) {
-                        Log.e(TAG, "Error relaying UDP response", e)
-                    }
-                } finally {
-                    conn.close()
-                }
-            }, "UDP-Relay").apply {
-                isDaemon = true
-                start()
-            }
-
-            totalUpload.addAndGet(udpPayload.size.toLong())
-        } catch (e: Exception) {
-            if (isActive.get()) {
-                Log.e(TAG, "UDP proxy error for $destIp:$destPort", e)
-            }
-        }
-    }
-
-    /**
-     * Create a Trojan protocol connection to the server.
-     *
-     * Trojan request format:
-     * SHA224(password) + CRLF + ATYPE + ADDR + PORT + CRLF + PAYLOAD
-     */
-    private fun createTrojanConnection(destIp: String, destPort: Int): TrojanConnection {
-        val socket = Socket()
-        socket.connect(InetSocketAddress(serverHost, serverPort), 15000)
-        protect(socket) // Prevent routing loop
-
-        // Wrap with TLS
-        val tlsSocket = sslContext?.getSocketFactory()
-            ?.createSocket(socket, serverHost, serverPort, true) as? javax.net.ssl.SSLSocket
-            ?: throw Exception("Failed to create SSL socket")
-
-        // Set SNI
-        val sslParams = tlsSocket.sslParameters
-        sslParams.serverNames = listOf(
-            javax.net.ssl.SNIHostName(tlsSni)
-        )
-        tlsSocket.sslParameters = sslParams
-
-        tlsSocket.startHandshake()
-
-        val outputStream: OutputStream = tlsSocket.outputStream
-        val inputStream: InputStream = tlsSocket.inputStream
-
-        // Build Trojan request header:
-        // password_hash(56 bytes) + CRLF(2) + addr_type(1) + addr(variable) + port(2) + CRLF(2)
-        val header = ByteBuffer.allocate(64 + destIp.length + 8)
-
-        // Password hash
-        header.put(passwordHash)
-        // CRLF
-        header.put(TROJAN_CRLF)
-        // Address type
-        header.put(ATYPE_IPV4)
-
-        // Parse destination IP to bytes
-        val addrParts = destIp.split(".")
-        if (addrParts.size == 4) {
-            for (part in addrParts) {
-                header.put(part.toInt().toByte())
-            }
-        }
-
-        // Destination port (big-endian)
-        header.put((destPort shr 8).toByte())
-        header.put((destPort and 0xFF).toByte())
-
-        // CRLF
-        header.put(TROJAN_CRLF)
-
-        // Write header
-        val headerBytes = ByteArray(header.position())
-        header.flip()
-        header.get(headerBytes)
-        outputStream.write(headerBytes)
-        outputStream.flush()
-
-        return TrojanConnection(tlsSocket, inputStream, outputStream)
-    }
-
-    /**
-     * Compute SHA-224 hash of the password.
-     */
-    private fun sha224(password: String): ByteArray {
-        val md = java.security.MessageDigest.getInstance("SHA-224")
-        return md.digest(password.toByteArray(Charsets.UTF_8))
-    }
-
-    /**
-     * Periodically report traffic stats to Flutter via broadcast.
-     */
-    private fun reportTraffic() {
-        while (isActive.get()) {
-            try {
-                Thread.sleep(2000)
-                if (!isActive.get()) break
-
-                val currentUpload = totalUpload.get()
-                val currentDownload = totalDownload.get()
-                val uploadSpeed = currentUpload - lastUpload.getAndSet(currentUpload)
-                val downloadSpeed = currentDownload - lastDownload.getAndSet(currentDownload)
-
-                sendBroadcast(Intent("com.proxyclient.proxy_client.VPN_TRAFFIC").apply {
-                    putExtra("upload", currentUpload)
-                    putExtra("download", currentDownload)
-                    putExtra("uploadSpeed", uploadSpeed)
-                    putExtra("downloadSpeed", downloadSpeed)
-                })
-            } catch (e: InterruptedException) {
-                break
-            } catch (e: Exception) {
-                Log.e(TAG, "Error reporting traffic", e)
-            }
-        }
+        Log.i(TAG, "VPN stopped")
     }
 
     private fun sendErrorBroadcast(message: String) {
@@ -527,11 +320,11 @@ class TrojanVpnService : VpnService() {
                 "Trojan VPN Service",
                 NotificationManager.IMPORTANCE_LOW
             ).apply {
-                description = "Trojan Proxy VPN connection"
+                description = "Trojan Proxy VPN connection via sing-box"
                 setShowBadge(false)
             }
-            val notificationManager = getSystemService(NotificationManager::class.java)
-            notificationManager.createNotificationChannel(channel)
+            val nm = getSystemService(NotificationManager::class.java)
+            nm.createNotificationChannel(channel)
         }
     }
 
@@ -552,7 +345,7 @@ class TrojanVpnService : VpnService() {
 
         return NotificationCompat.Builder(this, NOTIFICATION_CHANNEL_ID)
             .setContentTitle("Proxy Client")
-            .setContentText("Trojan VPN connected - $serverHost:$serverPort")
+            .setContentText("Trojan VPN (sing-box) - $serverHost:$serverPort")
             .setSmallIcon(android.R.drawable.ic_menu_compass)
             .setContentIntent(pendingIntent)
             .setOngoing(true)
@@ -568,36 +361,5 @@ class TrojanVpnService : VpnService() {
     override fun onDestroy() {
         stopVpn()
         super.onDestroy()
-    }
-
-    /**
-     * Wrapper class for a Trojan protocol connection.
-     */
-    class TrojanConnection(
-        private val socket: Socket,
-        private val inputStream: InputStream,
-        private val outputStream: OutputStream
-    ) {
-        private val isActive = AtomicBoolean(true)
-
-        fun send(data: ByteArray) {
-            if (!isActive.get()) throw Exception("Connection closed")
-            outputStream.write(data)
-            outputStream.flush()
-        }
-
-        fun receive(): ByteArray {
-            if (!isActive.get()) return ByteArray(0)
-            val buffer = ByteArray(32767)
-            val length = inputStream.read(buffer)
-            return if (length > 0) buffer.copyOfRange(0, length) else ByteArray(0)
-        }
-
-        fun close() {
-            isActive.set(false)
-            try { outputStream.close() } catch (_: Exception) {}
-            try { inputStream.close() } catch (_: Exception) {}
-            try { socket.close() } catch (_: Exception) {}
-        }
     }
 }

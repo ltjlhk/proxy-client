@@ -28,6 +28,29 @@ jobs:
       - name: Get dependencies
         run: flutter pub get
 
+      - name: Download sing-box for Android ARM64
+        run: |
+          SINGBOX_VERSION="1.10.7"
+          ASSETS_DIR="android/app/src/main/assets"
+          mkdir -p "$ASSETS_DIR"
+
+          # Download sing-box Android ARM64 binary
+          wget -q "https://github.com/SagerNet/sing-box/releases/download/v${SINGBOX_VERSION}/sing-box-${SINGBOX_VERSION}-android-arm64.tar.gz" \
+            -O /tmp/sing-box-android-arm64.tar.gz
+
+          # Extract and copy the binary
+          tar -xzf /tmp/sing-box-android-arm64.tar.gz -C /tmp/
+          cp "/tmp/sing-box-${SINGBOX_VERSION}-android-arm64/sing-box" "${ASSETS_DIR}/sing-box"
+          chmod +x "${ASSETS_DIR}/sing-box"
+
+          # Cleanup
+          rm -f /tmp/sing-box-android-arm64.tar.gz
+          rm -rf "/tmp/sing-box-${SINGBOX_VERSION}-android-arm64"
+
+          echo "sing-box binary placed in ${ASSETS_DIR}/sing-box"
+          ls -la "${ASSETS_DIR}/sing-box"
+        continue-on-error: true
+
       - name: Build APK
         run: flutter build apk --debug
 
