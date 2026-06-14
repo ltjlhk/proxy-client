@@ -15,7 +15,6 @@ class MainActivity : FlutterActivity() {
 
     companion object {
         const val VPN_CHANNEL = "com.proxyclient.proxy_client/vpn"
-        const val VPN_METHOD_CHANNEL = "com.proxyclient.proxy_client/vpn_method"
         const val VPN_REQUEST_CODE = 1001
     }
 
@@ -40,6 +39,22 @@ class MainActivity : FlutterActivity() {
                             "message" to "VPN disconnected"
                         ))
                     }
+                    "com.proxyclient.proxy_client.VPN_ERROR" -> {
+                        val errorMsg = intent.getStringExtra("errorMessage") ?: "Unknown error"
+                        vpnEventSink?.success(mapOf(
+                            "type" to "error",
+                            "message" to errorMsg
+                        ))
+                    }
+                    "com.proxyclient.proxy_client.VPN_TRAFFIC" -> {
+                        vpnEventSink?.success(mapOf(
+                            "type" to "traffic",
+                            "upload" to (intent.getLongExtra("upload", 0)),
+                            "download" to (intent.getLongExtra("download", 0)),
+                            "uploadSpeed" to (intent.getLongExtra("uploadSpeed", 0)),
+                            "downloadSpeed" to (intent.getLongExtra("downloadSpeed", 0))
+                        ))
+                    }
                 }
             }
         }
@@ -47,6 +62,8 @@ class MainActivity : FlutterActivity() {
         val filter = IntentFilter().apply {
             addAction("com.proxyclient.proxy_client.VPN_CONNECTED")
             addAction("com.proxyclient.proxy_client.VPN_DISCONNECTED")
+            addAction("com.proxyclient.proxy_client.VPN_ERROR")
+            addAction("com.proxyclient.proxy_client.VPN_TRAFFIC")
         }
         registerReceiver(vpnStatusReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
     }
@@ -65,50 +82,52 @@ class MainActivity : FlutterActivity() {
                 }
             })
 
-        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, VPN_METHOD_CHANNEL)
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, VPN_CHANNEL)
             .setMethodCallHandler { call, result ->
                 when (call.method) {
-                    "connectVpn" -> {
+                    "connect" -> {
                         val host = call.argument<String>("host") ?: "47.80.241.156"
-                        val port = call.argument<Int>("port") ?: 7890
-                        val mode = call.argument<String>("mode") ?: "global"
-                        connectVpn(host, port, mode)
+                        val port = call.argument<Int>("port") ?: 8443
+                        val password = call.argument<String>("password") ?: "proxy123456"
+                        val sni = call.argument<String>("sni") ?: "proxy.local"
+                        connectVpn(host, port, password, sni)
                         result.success(true)
                     }
-                    "disconnectVpn" -> {
+                    "disconnect" -> {
                         disconnectVpn()
                         result.success(true)
                     }
                     "isVpnRunning" -> {
-                        result.success(ProxyVpnService.isRunning)
+                        result.success(TrojanVpnService.isRunning)
                     }
                     else -> result.notImplemented()
                 }
             }
     }
 
-    private fun connectVpn(host: String, port: Int, mode: String) {
+    private fun connectVpn(host: String, port: Int, password: String, sni: String) {
         val intent = VpnService.prepare(this)
         if (intent != null) {
             startActivityForResult(intent, VPN_REQUEST_CODE)
         } else {
-            startVpnService(host, port, mode)
+            startVpnService(host, port, password, sni)
         }
     }
 
     private fun disconnectVpn() {
-        val intent = Intent(this, ProxyVpnService::class.java).apply {
-            action = ProxyVpnService.ACTION_DISCONNECT
+        val intent = Intent(this, TrojanVpnService::class.java).apply {
+            action = TrojanVpnService.ACTION_DISCONNECT
         }
         startService(intent)
     }
 
-    private fun startVpnService(host: String, port: Int, mode: String) {
-        val intent = Intent(this, ProxyVpnService::class.java).apply {
-            action = ProxyVpnService.ACTION_CONNECT
-            putExtra("proxyHost", host)
-            putExtra("proxyPort", port)
-            putExtra("proxyMode", mode)
+    private fun startVpnService(host: String, port: Int, password: String, sni: String) {
+        val intent = Intent(this, TrojanVpnService::class.java).apply {
+            action = TrojanVpnService.ACTION_CONNECT
+            putExtra("serverHost", host)
+            putExtra("serverPort", port)
+            putExtra("trojanPassword", password)
+            putExtra("tlsSni", sni)
         }
         startService(intent)
     }
@@ -117,11 +136,11 @@ class MainActivity : FlutterActivity() {
         super.onActivityResult(requestCode, resultCode, data)
         if (requestCode == VPN_REQUEST_CODE) {
             if (resultCode == RESULT_OK) {
-                startVpnService("47.80.241.156", 7890, "global")
+                startVpnService("47.80.241.156", 8443, "proxy123456", "proxy.local")
             } else {
                 vpnEventSink?.success(mapOf(
                     "type" to "error",
-                    "message" to "VPN permission denied"
+                    "message" to "VPN permission denied by user"
                 ))
             }
         }

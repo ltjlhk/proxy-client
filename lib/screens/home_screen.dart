@@ -1,10 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import '../providers/vpn_provider.dart';
-import '../providers/settings_provider.dart';
-import '../widgets/connection_button.dart';
-import '../widgets/traffic_stats_card.dart';
-import '../widgets/proxy_mode_selector.dart';
 
 class HomeScreen extends StatelessWidget {
   const HomeScreen({super.key});
@@ -13,159 +9,269 @@ class HomeScreen extends StatelessWidget {
   Widget build(BuildContext context) {
     return Scaffold(
       body: SafeArea(
-        child: CustomScrollView(
-          slivers: [
-            SliverToBoxAdapter(
-              child: Padding(
-                padding: const EdgeInsets.fromLTRB(20, 16, 20, 8),
-                child: Row(
-                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                  children: [
-                    Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text(
-                          'Proxy Client',
-                          style: TextStyle(
-                            fontSize: 24,
-                            fontWeight: FontWeight.bold,
-                            color: Colors.white.withOpacity(0.95),
-                          ),
+        child: Column(
+          children: [
+            // Title bar
+            Padding(
+              padding: const EdgeInsets.fromLTRB(20, 20, 20, 0),
+              child: Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  const Text(
+                    'Proxy Client',
+                    style: TextStyle(
+                      fontSize: 24,
+                      fontWeight: FontWeight.bold,
+                      color: Colors.white,
+                    ),
+                  ),
+                  Consumer<VpnProvider>(
+                    builder: (context, vpn, child) {
+                      return Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 12,
+                          vertical: 6,
                         ),
-                        const SizedBox(height: 4),
-                        Consumer<SettingsProvider>(
-                          builder: (context, settings, child) {
-                            final node = settings.selectedNode;
-                            return Text(
-                              node != null ? node.name : '未选择节点',
-                              style: TextStyle(
-                                fontSize: 14,
-                                color: Colors.white.withOpacity(0.5),
+                        decoration: BoxDecoration(
+                          color: const Color(0xFF161B22),
+                          borderRadius: BorderRadius.circular(20),
+                        ),
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Container(
+                              width: 8,
+                              height: 8,
+                              decoration: BoxDecoration(
+                                color: vpn.isConnected
+                                    ? const Color(0xFF3FB950)
+                                    : vpn.isConnecting
+                                        ? const Color(0xFFD29922)
+                                        : const Color(0xFFF85149),
+                                shape: BoxShape.circle,
                               ),
-                            );
-                          },
+                            ),
+                            const SizedBox(width: 6),
+                            Text(
+                              vpn.isConnected
+                                  ? 'Connected'
+                                  : vpn.isConnecting
+                                      ? 'Connecting'
+                                      : 'Disconnected',
+                              style: const TextStyle(
+                                fontSize: 12,
+                                color: Colors.white,
+                                fontWeight: FontWeight.w500,
+                              ),
+                            ),
+                          ],
+                        ),
+                      );
+                    },
+                  ),
+                ],
+              ),
+            ),
+
+            const Spacer(),
+
+            // Central connection button
+            Consumer<VpnProvider>(
+              builder: (context, vpn, child) {
+                return GestureDetector(
+                  onTap: () => vpn.toggleConnection(),
+                  child: AnimatedContainer(
+                    duration: const Duration(milliseconds: 300),
+                    curve: Curves.easeInOut,
+                    width: 180,
+                    height: 180,
+                    decoration: BoxDecoration(
+                      shape: BoxShape.circle,
+                      gradient: LinearGradient(
+                        begin: Alignment.topLeft,
+                        end: Alignment.bottomRight,
+                        colors: vpn.isConnected
+                            ? [
+                                const Color(0xFF238636),
+                                const Color(0xFF2EA043),
+                              ]
+                            : vpn.isConnecting
+                                ? [
+                                    const Color(0xFF9E6A03),
+                                    const Color(0xFFD29922),
+                                  ]
+                                : [
+                                    const Color(0xFF30363D),
+                                    const Color(0xFF484F58),
+                                  ],
+                      ),
+                      boxShadow: [
+                        BoxShadow(
+                          color: (vpn.isConnected
+                                  ? const Color(0xFF238636)
+                                  : vpn.isConnecting
+                                      ? const Color(0xFFD29922)
+                                      : const Color(0xFF484F58))
+                              .withOpacity(0.4),
+                          blurRadius: 30,
+                          spreadRadius: 2,
                         ),
                       ],
                     ),
-                    Container(
-                      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-                      decoration: BoxDecoration(
-                        color: const Color(0xFF2A2A2A),
-                        borderRadius: BorderRadius.circular(20),
-                      ),
-                      child: Consumer<VpnProvider>(
-                        builder: (context, vpn, child) {
-                          return Row(
-                            mainAxisSize: MainAxisSize.min,
-                            children: [
-                              Container(
-                                width: 8,
-                                height: 8,
-                                decoration: BoxDecoration(
-                                  color: vpn.isConnected
-                                      ? const Color(0xFF00D26A)
-                                      : const Color(0xFFFF4444),
-                                  shape: BoxShape.circle,
-                                ),
-                              ),
-                              const SizedBox(width: 6),
-                              Text(
-                                vpn.isConnected ? '已连接' : '未连接',
-                                style: const TextStyle(
-                                  fontSize: 12,
-                                  color: Colors.white,
-                                  fontWeight: FontWeight.w500,
-                                ),
-                              ),
-                            ],
-                          );
-                        },
-                      ),
+                    child: Column(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        Icon(
+                          vpn.isConnected
+                              ? Icons.power_settings_new
+                              : vpn.isConnecting
+                                  ? Icons.hourglass_top
+                                  : Icons.power_settings_new,
+                          size: 60,
+                          color: Colors.white.withOpacity(0.9),
+                        ),
+                        const SizedBox(height: 8),
+                        Text(
+                          vpn.isConnected
+                              ? 'CONNECTED'
+                              : vpn.isConnecting
+                                  ? 'CONNECTING'
+                                  : 'TAP TO CONNECT',
+                          style: TextStyle(
+                            fontSize: 13,
+                            fontWeight: FontWeight.w600,
+                            color: Colors.white.withOpacity(0.8),
+                            letterSpacing: 1.2,
+                          ),
+                        ),
+                      ],
                     ),
-                  ],
+                  ),
+                );
+              },
+            ),
+
+            const Spacer(),
+
+            // Traffic stats
+            Consumer<VpnProvider>(
+              builder: (context, vpn, child) {
+                return Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 40),
+                  child: Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      _buildTrafficItem(
+                        icon: Icons.arrow_upward,
+                        label: 'Upload',
+                        value: _formatBytes(vpn.uploadBytes),
+                        speed: vpn.isConnected
+                            ? '${_formatSpeed(vpn.uploadSpeed)}/s'
+                            : null,
+                      ),
+                      _buildTrafficItem(
+                        icon: Icons.arrow_downward,
+                        label: 'Download',
+                        value: _formatBytes(vpn.downloadBytes),
+                        speed: vpn.isConnected
+                            ? '${_formatSpeed(vpn.downloadSpeed)}/s'
+                            : null,
+                      ),
+                    ],
+                  ),
+                );
+              },
+            ),
+
+            const SizedBox(height: 30),
+
+            // Server info card
+            Container(
+              margin: const EdgeInsets.symmetric(horizontal: 20),
+              padding: const EdgeInsets.all(16),
+              decoration: BoxDecoration(
+                color: const Color(0xFF161B22),
+                borderRadius: BorderRadius.circular(16),
+                border: Border.all(
+                  color: const Color(0xFF30363D),
+                  width: 1,
                 ),
               ),
-            ),
-            const SliverToBoxAdapter(
-              child: SizedBox(height: 30),
-            ),
-            const SliverToBoxAdapter(
-              child: ConnectionButton(),
-            ),
-            const SliverToBoxAdapter(
-              child: SizedBox(height: 30),
-            ),
-            const SliverToBoxAdapter(
-              child: ProxyModeSelector(),
-            ),
-            const SliverToBoxAdapter(
-              child: SizedBox(height: 20),
-            ),
-            const SliverToBoxAdapter(
-              child: TrafficStatsCard(),
-            ),
-            const SliverToBoxAdapter(
-              child: SizedBox(height: 20),
-            ),
-            SliverToBoxAdapter(
-              child: Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 20),
-                child: _buildInfoCard(context),
+              child: Column(
+                children: [
+                  _buildInfoRow('Protocol', 'Trojan'),
+                  const SizedBox(height: 8),
+                  _buildInfoRow('Server', '47.80.241.156'),
+                  const SizedBox(height: 8),
+                  _buildInfoRow('Port', '8443'),
+                  const SizedBox(height: 8),
+                  _buildInfoRow('TLS SNI', 'proxy.local'),
+                ],
               ),
             ),
-            const SliverToBoxAdapter(
-              child: SizedBox(height: 30),
+
+            // Error message
+            Consumer<VpnProvider>(
+              builder: (context, vpn, child) {
+                if (vpn.errorMessage.isNotEmpty) {
+                  return Padding(
+                    padding: const EdgeInsets.fromLTRB(20, 12, 20, 0),
+                    child: Text(
+                      vpn.errorMessage,
+                      style: const TextStyle(
+                        color: Color(0xFFF85149),
+                        fontSize: 13,
+                      ),
+                      textAlign: TextAlign.center,
+                    ),
+                  );
+                }
+                return const SizedBox.shrink();
+              },
             ),
+
+            const SizedBox(height: 30),
           ],
         ),
       ),
     );
   }
 
-  Widget _buildInfoCard(BuildContext context) {
-    return Container(
-      padding: const EdgeInsets.all(16),
-      decoration: BoxDecoration(
-        color: const Color(0xFF2A2A2A),
-        borderRadius: BorderRadius.circular(16),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Row(
-            children: [
-              Icon(
-                Icons.info_outline,
-                size: 18,
-                color: Colors.white.withOpacity(0.6),
-              ),
-              const SizedBox(width: 8),
-              Text(
-                '连接信息',
-                style: TextStyle(
-                  fontSize: 14,
-                  fontWeight: FontWeight.w600,
-                  color: Colors.white.withOpacity(0.8),
-                ),
-              ),
-            ],
+  Widget _buildTrafficItem({
+    required IconData icon,
+    required String label,
+    required String value,
+    String? speed,
+  }) {
+    return Column(
+      children: [
+        Icon(icon, size: 20, color: const Color(0xFF58A6FF)),
+        const SizedBox(height: 4),
+        Text(
+          label,
+          style: const TextStyle(
+            fontSize: 12,
+            color: Color(0xFF8B949E),
           ),
-          const SizedBox(height: 12),
-          Consumer<SettingsProvider>(
-            builder: (context, settings, child) {
-              return Column(
-                children: [
-                  _buildInfoRow('服务器', settings.serverAddress),
-                  const SizedBox(height: 8),
-                  _buildInfoRow('端口', settings.serverPort.toString()),
-                  const SizedBox(height: 8),
-                  _buildInfoRow('协议', 'SOCKS5'),
-                ],
-              );
-            },
+        ),
+        const SizedBox(height: 2),
+        Text(
+          value,
+          style: const TextStyle(
+            fontSize: 16,
+            fontWeight: FontWeight.w600,
+            color: Colors.white,
           ),
-        ],
-      ),
+        ),
+        if (speed != null)
+          Text(
+            speed,
+            style: const TextStyle(
+              fontSize: 11,
+              color: Color(0xFF58A6FF),
+            ),
+          ),
+      ],
     );
   }
 
@@ -175,9 +281,9 @@ class HomeScreen extends StatelessWidget {
       children: [
         Text(
           label,
-          style: TextStyle(
+          style: const TextStyle(
             fontSize: 13,
-            color: Colors.white.withOpacity(0.5),
+            color: Color(0xFF8B949E),
           ),
         ),
         Text(
@@ -190,5 +296,22 @@ class HomeScreen extends StatelessWidget {
         ),
       ],
     );
+  }
+
+  static String _formatBytes(int bytes) {
+    if (bytes < 1024) return '$bytes B';
+    if (bytes < 1048576) return '${(bytes / 1024).toStringAsFixed(1)} KB';
+    if (bytes < 1073741824) {
+      return '${(bytes / 1048576).toStringAsFixed(1)} MB';
+    }
+    return '${(bytes / 1073741824).toStringAsFixed(2)} GB';
+  }
+
+  static String _formatSpeed(int bytesPerSecond) {
+    if (bytesPerSecond < 1024) return '$bytesPerSecond B';
+    if (bytesPerSecond < 1048576) {
+      return '${(bytesPerSecond / 1024).toStringAsFixed(1)} KB';
+    }
+    return '${(bytesPerSecond / 1048576).toStringAsFixed(1)} MB';
   }
 }

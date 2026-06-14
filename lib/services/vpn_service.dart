@@ -2,19 +2,21 @@ import 'package:flutter/services.dart';
 
 class VpnNativeService {
   static const MethodChannel _methodChannel = MethodChannel(
-    'com.proxyclient.proxy_client/vpn_method',
+    'com.proxyclient.proxy_client/vpn',
   );
 
-  static Future<bool> connectVpn({
+  static Future<bool> connect({
     required String host,
     required int port,
-    String mode = 'global',
+    required String password,
+    required String sni,
   }) async {
     try {
-      final result = await _methodChannel.invokeMethod<bool>('connectVpn', {
+      final result = await _methodChannel.invokeMethod<bool>('connect', {
         'host': host,
         'port': port,
-        'mode': mode,
+        'password': password,
+        'sni': sni,
       });
       return result ?? false;
     } catch (e) {
@@ -22,9 +24,9 @@ class VpnNativeService {
     }
   }
 
-  static Future<bool> disconnectVpn() async {
+  static Future<bool> disconnect() async {
     try {
-      final result = await _methodChannel.invokeMethod<bool>('disconnectVpn');
+      final result = await _methodChannel.invokeMethod<bool>('disconnect');
       return result ?? false;
     } catch (e) {
       return false;
