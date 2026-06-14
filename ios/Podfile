@@ -32,10 +32,22 @@ def flutter_root
   end
   
   # Fallback if FLUTTER_ROOT not found in file
-  ENV['FLUTTER_ROOT'] || '/opt/hostedtoolcache/flutter/stable-3.24.5-x64/flutter'
+   ENV['FLUTTER_ROOT'] || '/opt/hostedtoolcache/flutter/stable-3.24.5-x64/flutter'
 end
 
-require File.expand_path(File.join('packages', 'flutter_tools', 'bin', 'podhelper'), flutter_root)
+# Determine correct podhelper path based on architecture
+podhelper_paths = [
+  File.join(flutter_root, 'packages', 'flutter_tools', 'bin', 'podhelper'),
+  File.join('/opt/hostedtoolcache/flutter/stable-3.24.5-arm64/flutter', 'packages', 'flutter_tools', 'bin', 'podhelper'),
+  File.join('/opt/hostedtoolcache/flutter/stable-3.24.5-x64/flutter', 'packages', 'flutter_tools', 'bin', 'podhelper')
+]
+
+podhelper_path = podhelper_paths.find { |path| File.exist?(path) }
+unless podhelper_path
+  raise "Could not find podhelper. Tried: #{podhelper_paths.join(', ')}"
+end
+
+require podhelper_path
 
 flutter_ios_podfile_setup
 
