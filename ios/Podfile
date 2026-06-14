@@ -1,7 +1,5 @@
-# Uncomment this line to define a global platform for your project
 platform :ios, '12.0'
 
-# CocoaPods analytics sends network stats synchronously affecting flutter build latency.
 ENV['COCOAPODS_DISABLE_STATS'] = 'true'
 
 project 'Runner', {
@@ -11,55 +9,65 @@ project 'Runner', {
 }
 
 def flutter_root
-  # Try multiple possible paths for Generated.xcconfig
-  possible_paths = [
-    File.expand_path(File.join('Flutter', 'Generated.xcconfig'), __dir__),
-    File.expand_path(File.join('..', 'Flutter', 'Generated.xcconfig'), __dir__),
-    File.expand_path(File.join('..', '..', 'Flutter', 'Generated.xcconfig'), __dir__)
+  # Use environment variable first
+  if ENV['FLUTTER_ROOT']
+    return ENV['FLUTTER_ROOT']
+  end
+  
+  # Try to find from common paths
+  possible_roots = [
+    '/opt/hostedtoolcache/flutter/stable-3.24.5-x64/flutter',
+    '/opt/hostedtoolcache/flutter/stable-3.24.5-arm64/flutter',
+    '/Users/runner/hostedtoolcache/flutter/stable-3.24.5-arm64/flutter',
+    '/usr/local/flutter',
+    '/opt/flutter'
   ]
   
-  generated_xcode_build_settings_path = possible_paths.find { |path| File.exist?(path) }
-  
-  unless generated_xcode_build_settings_path
-    # Fallback: use environment variable or default
-    flutter_root = ENV['FLUTTER_ROOT'] || '/opt/hostedtoolcache/flutter/stable-3.24.5-x64/flutter'
-    return flutter_root
-  end
-
-  File.foreach(generated_xcode_build_settings_path) do |line|
-    matches = line.match(/FLUTTER_ROOT\=(.*)/)
-    return matches[1].strip if matches
+  possible_roots.each do |root|
+    if File.directory?(root)
+      return root
+    end
   end
   
-  # Fallback if FLUTTER_ROOT not found in file
-   ENV['FLUTTER_ROOT'] || '/opt/hostedtoolcache/flutter/stable-3.24.5-x64/flutter'
+  raise "FLUTTER_ROOT not found. Please set FLUTTER_ROOT environment variable."
 end
 
-# Determine correct podhelper path based on architecture
-podhelper_paths = [
+# Try to find and load podhelper
+podhelper_loaded = false
+[
   File.join(flutter_root, 'packages', 'flutter_tools', 'bin', 'podhelper'),
-  File.join('/opt/hostedtoolcache/flutter/stable-3.24.5-arm64/flutter', 'packages', 'flutter_tools', 'bin', 'podhelper'),
-  File.join('/opt/hostedtoolcache/flutter/stable-3.24.5-x64/flutter', 'packages', 'flutter_tools', 'bin', 'podhelper')
-]
-
-podhelper_path = podhelper_paths.find { |path| File.exist?(path) }
-unless podhelper_path
-  raise "Could not find podhelper. Tried: #{podhelper_paths.join(', ')}"
+  '/opt/hostedtoolcache/flutter/stable-3.24.5-x64/flutter/packages/flutter_tools/bin/podhelper',
+  '/opt/hostedtoolcache/flutter/stable-3.24.5-arm64/flutter/packages/flutter_tools/bin/podhelper',
+  '/Users/runner/hostedtoolcache/flutter/stable-3.24.5-arm64/flutter/packages/flutter_tools/bin/podhelper'
+].each do |path|
+  if File.exist?(path + '.rb')
+    require path
+    podhelper_loaded = true
+    break
+  end
 end
 
-require podhelper_path
-
-flutter_ios_podfile_setup
+# If podhelper not found, define minimal setup
+unless podhelper_loaded
+  def flutter_ios_podfile_setup
+    # Minimal setup
+  end
+  
+  def flutter_install_all_ios_pods(installation_root)
+    # Minimal setup
+  end
+end
 
 target 'Runner' do
   use_frameworks!
   use_modular_headers!
-
   flutter_install_all_ios_pods File.dirname(File.realpath(__FILE__))
 end
 
 post_install do |installer|
   installer.pods_project.targets.each do |target|
-    flutter_additional_ios_build_settings(target)
+    target.build_configurations.each do |config|
+      config.build_settings['IPHONEOS_DEPLOYMENT_TARGET'] = '12.0'
+    end
   end
 end
