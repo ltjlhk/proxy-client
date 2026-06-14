@@ -64,11 +64,11 @@ class TrojanVpnService : VpnService() {
             private set
 
         // Trojan protocol constants
-        private const val TROJAN_CR_LF = "\r\n"
-        private const val TROJAN_CRLF = "\r\n".toByteArray()
         private const val ATYPE_IPV4: Byte = 0x01
         private const val ATYPE_DOMAIN: Byte = 0x03
         private const val ATYPE_IPV6: Byte = 0x04
+
+        private val TROJAN_CRLF = "\r\n".toByteArray()
     }
 
     private var vpnInterface: ParcelFileDescriptor? = null
@@ -427,11 +427,8 @@ class TrojanVpnService : VpnService() {
 
         // Wrap with TLS
         val tlsSocket = sslContext?.getSocketFactory()
-            ?.createSocket(socket, serverHost, serverPort, true)
-            ?: throw Exception("SSL context not initialized")
-
-        // Enable all supported protocols
-        tlsSocket.enabledProtocols = tlsSocket.supportedProtocols
+            ?.createSocket(socket, serverHost, serverPort, true) as? javax.net.ssl.SSLSocket
+            ?: throw Exception("Failed to create SSL socket")
 
         // Set SNI
         val sslParams = tlsSocket.sslParameters
