@@ -1,0 +1,24 @@
+# Flutter
+.dart_tool/
+.packages
+build/
+*.iml
+.metadata
+pubspec.lock
+
+# Android
+.gradle/
+.idea/
+*.hprof
+*.apk
+*.ap_
+*.dex
+local.properties
+
+# iOS
+Pods/
+*.xcworkspace
+*.xcuserdata
+
+# macOS
+.DS_Store
