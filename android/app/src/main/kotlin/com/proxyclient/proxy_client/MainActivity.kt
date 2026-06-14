@@ -5,7 +5,10 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.net.VpnService
+import android.os.Build
 import android.os.Bundle
+import androidx.activity.result.ActivityResultLauncher
+import androidx.activity.result.contract.ActivityResultContracts
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.EventChannel
@@ -15,14 +18,34 @@ class MainActivity : FlutterActivity() {
 
     companion object {
         const val VPN_CHANNEL = "com.proxyclient.proxy_client/vpn"
-        const val VPN_REQUEST_CODE = 1001
     }
 
     private var vpnEventSink: EventChannel.EventSink? = null
     private lateinit var vpnStatusReceiver: BroadcastReceiver
+    private lateinit var vpnPermissionLauncher: ActivityResultLauncher<Intent>
+
+    // Store connection params for use after permission granted
+    private var pendingHost = "47.80.241.156"
+    private var pendingPort = 8443
+    private var pendingPassword = "proxy123456"
+    private var pendingSni = "proxy.local"
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        // Register the VPN permission result launcher
+        vpnPermissionLauncher = registerForActivityResult(
+            ActivityResultContracts.StartActivityForResult()
+        ) { result ->
+            if (result.resultCode == RESULT_OK) {
+                startVpnService(pendingHost, pendingPort, pendingPassword, pendingSni)
+            } else {
+                vpnEventSink?.success(mapOf(
+                    "type" to "error",
+                    "message" to "VPN permission denied by user"
+                ))
+            }
+        }
 
         vpnStatusReceiver = object : BroadcastReceiver() {
             override fun onReceive(context: Context?, intent: Intent?) {
@@ -65,7 +88,11 @@ class MainActivity : FlutterActivity() {
             addAction("com.proxyclient.proxy_client.VPN_ERROR")
             addAction("com.proxyclient.proxy_client.VPN_TRAFFIC")
         }
-        registerReceiver(vpnStatusReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            registerReceiver(vpnStatusReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            registerReceiver(vpnStatusReceiver, filter)
+        }
     }
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
@@ -90,6 +117,10 @@ class MainActivity : FlutterActivity() {
                         val port = call.argument<Int>("port") ?: 8443
                         val password = call.argument<String>("password") ?: "proxy123456"
                         val sni = call.argument<String>("sni") ?: "proxy.local"
+                        pendingHost = host
+                        pendingPort = port
+                        pendingPassword = password
+                        pendingSni = sni
                         connectVpn(host, port, password, sni)
                         result.success(true)
                     }
@@ -108,8 +139,10 @@ class MainActivity : FlutterActivity() {
     private fun connectVpn(host: String, port: Int, password: String, sni: String) {
         val intent = VpnService.prepare(this)
         if (intent != null) {
-            startActivityForResult(intent, VPN_REQUEST_CODE)
+            // Need user permission - launch the VPN permission dialog
+            vpnPermissionLauncher.launch(intent)
         } else {
+            // Already have permission - start directly
             startVpnService(host, port, password, sni)
         }
     }
@@ -118,7 +151,11 @@ class MainActivity : FlutterActivity() {
         val intent = Intent(this, TrojanVpnService::class.java).apply {
             action = TrojanVpnService.ACTION_DISCONNECT
         }
-        startService(intent)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            startForegroundService(intent)
+        } else {
+            startService(intent)
+        }
     }
 
     private fun startVpnService(host: String, port: Int, password: String, sni: String) {
@@ -129,20 +166,10 @@ class MainActivity : FlutterActivity() {
             putExtra("trojanPassword", password)
             putExtra("tlsSni", sni)
         }
-        startService(intent)
-    }
-
-    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
-        super.onActivityResult(requestCode, resultCode, data)
-        if (requestCode == VPN_REQUEST_CODE) {
-            if (resultCode == RESULT_OK) {
-                startVpnService("47.80.241.156", 8443, "proxy123456", "proxy.local")
-            } else {
-                vpnEventSink?.success(mapOf(
-                    "type" to "error",
-                    "message" to "VPN permission denied by user"
-                ))
-            }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            startForegroundService(intent)
+        } else {
+            startService(intent)
         }
     }
 
