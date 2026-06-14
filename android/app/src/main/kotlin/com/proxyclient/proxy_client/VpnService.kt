@@ -115,7 +115,8 @@ class TrojanVpnService : VpnService() {
             startForeground(NOTIFICATION_ID, createNotification("Starting SOCKS5 proxy..."))
 
             // Launch SOCKS5 server in a background thread
-            proxyThread = Thread({ runSocks5Server() }, "SOCKS5-Server").start()
+            proxyThread = Thread({ runSocks5Server() }, "SOCKS5-Server")
+            proxyThread?.start()
 
             Log.i(TAG, "SOCKS5 proxy starting on port $localSocksPort, Trojan server: $serverHost:$serverPort")
         } catch (e: Exception) {
